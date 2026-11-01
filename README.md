@@ -21,3 +21,7 @@ Shared tokenizer and chat-template library for the SpacemiT K3 platform
 For master architecture and detailed component specifications, see the parent [model-runner](https://github.com/LMA1980/model-runner) repository:
 - Master Plan: [PLAN.md](https://github.com/LMA1980/model-runner/blob/main/PLAN.md)
 - Specs: [specs/runtime/](https://github.com/LMA1980/model-runner/tree/main/specs/runtime)
+
+## License
+
+Licensed under the GNU Lesser General Public License v3.0 with the LGPL-3.0 Linking Exception (`LGPL-3.0-only WITH LGPL-3.0-linking-exception`). See [LICENSE](LICENSE) for details.
