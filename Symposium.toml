@@ -1,0 +1,6 @@
+name = "k3-tokenizer"
+# Crate-embedded Symposium manifest for k3-tokenizer.
+
+[[plugins]]
+depends-on = ["k3-core"]
+source.cargo = "k3-core"
