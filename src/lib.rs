@@ -111,6 +111,62 @@ impl ChatTemplate {
 
         user_prompt.to_owned()
     }
+
+    /// Formats a prompt using the NVIDIA Nemotron-Labs Dory1.0 `ChatML` + `<think>` template:
+    /// - `bos = "<s>"`, `eos = "<|im_end|>"`
+    /// - When `reasoning_effort == Some("medium")`, appends `" {reasoning effort: efficient}"` to the user turn
+    /// - When `enable_thinking` is `true` (default when `reasoning_effort != Some("low")`), opens `<think>\n`;
+    ///   when `false`, emits an empty `<think></think>` block.
+    #[must_use]
+    pub fn format_dory_prompt(
+        &self,
+        user_prompt: &str,
+        reasoning_effort: Option<&str>,
+        enable_thinking: bool,
+    ) -> String {
+        format_dory_chatml_prompt(user_prompt, reasoning_effort, enable_thinking)
+    }
+}
+
+/// Canonical Dory1.0 beginning-of-sequence token string (`"<s>"`).
+pub const DORY_BOS_TOKEN: &str = "<s>";
+
+/// Canonical Dory1.0 end-of-turn / end-of-sequence token string (`"<|im_end|>"`).
+pub const DORY_EOS_TOKEN: &str = "<|im_end|>";
+
+/// Suffix appended to the last user message under `"medium"` reasoning effort in Dory1.0.
+pub const DORY_MEDIUM_REASONING_SUFFIX: &str = " {reasoning effort: efficient}";
+
+/// Formats a user prompt using Dory1.0's `ChatML` + `<think>` template (`bos = "<s>"`, `eos = "<|im_end|>"`).
+#[must_use]
+pub fn format_dory_chatml_prompt(
+    user_prompt: &str,
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
+) -> String {
+    let is_medium = reasoning_effort
+        .map(str::trim)
+        .is_some_and(|e| e.eq_ignore_ascii_case("medium"));
+    let is_low = reasoning_effort
+        .map(str::trim)
+        .is_some_and(|e| e.eq_ignore_ascii_case("low"));
+
+    let effective_thinking = enable_thinking && !is_low;
+    let user_turn = if is_medium {
+        format!("{user_prompt}{DORY_MEDIUM_REASONING_SUFFIX}")
+    } else {
+        user_prompt.to_owned()
+    };
+
+    if effective_thinking {
+        format!(
+            "{DORY_BOS_TOKEN}<|im_start|>user\n{user_turn}{DORY_EOS_TOKEN}\n<|im_start|>assistant\n<think>\n"
+        )
+    } else {
+        format!(
+            "{DORY_BOS_TOKEN}<|im_start|>user\n{user_turn}{DORY_EOS_TOKEN}\n<|im_start|>assistant\n<think></think>"
+        )
+    }
 }
 
 /// Tokenizer abstraction for text encoding and real-time token streaming.
@@ -1038,5 +1094,26 @@ mod tests {
             DetokenizeStep::Stop(String::new())
         ); // "<|im_end|>" triggers Stop without emitting stop marker!
         assert!(stream.is_stopped());
+    }
+
+    #[test]
+    fn test_dory_chatml_think_template_formatting() {
+        let high = format_dory_chatml_prompt("Solve 2+2", Some("high"), true);
+        assert_eq!(
+            high,
+            "<s><|im_start|>user\nSolve 2+2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+
+        let medium = format_dory_chatml_prompt("Solve 2+2", Some("medium"), true);
+        assert_eq!(
+            medium,
+            "<s><|im_start|>user\nSolve 2+2 {reasoning effort: efficient}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+
+        let low = format_dory_chatml_prompt("Solve 2+2", Some("low"), true);
+        assert_eq!(
+            low,
+            "<s><|im_start|>user\nSolve 2+2<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
     }
 }
