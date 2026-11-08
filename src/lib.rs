@@ -1,4 +1,4 @@
-//! `k3-tokenizer`: Shared tokenizer, chat template, and streaming piece decoder.
+//! `jero-tokenizer`: Shared tokenizer, chat template, and streaming piece decoder.
 //!
 //! Provides decoupled tokenization interfaces shared between `k3-diag` and
 //! `k3-manager` per ADR-025 without dragging in engine compute or hardware
@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use k3_core::{GgufArray, GgufFile, GgufValue, K3Error};
+use jero_core::{GgufArray, GgufFile, GgufValue, K3Error};
 
 /// GGUF token type classification (`tokenizer.ggml.token_type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -961,7 +961,7 @@ fn parse_hex_byte_token(token: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::test_helpers::{create_synthetic_gguf_v3, create_synthetic_gguf_v3_with_kvs};
+    use jero_core::test_helpers::{create_synthetic_gguf_v3, create_synthetic_gguf_v3_with_kvs};
 
     #[test]
     fn test_tokenizer_encoding_and_decoding() {

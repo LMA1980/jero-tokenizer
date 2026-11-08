@@ -1,0 +1,6 @@
+name = "jero-tokenizer"
+# Crate-embedded Symposium manifest for jero-tokenizer.
+
+[[plugins]]
+depends-on = ["jero-core"]
+source.cargo = "jero-core"
