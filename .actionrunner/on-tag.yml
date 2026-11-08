@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-tokenizer Release Pipeline"
+name: "jero-tokenizer Release Pipeline"
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,11 +30,11 @@ stages:
     tags: ["k3"]
     depends_on: ["coverage-check"]
     threads: 2
-    run: "cargo +nightly miri test -p k3-tokenizer --lib"
+    run: "cargo +nightly miri test -p jero-tokenizer --lib"
 
   - id: build-release
     name: "Build Production Optimized Library"
     tags: ["k3"]
     depends_on: ["miri-check"]
     threads: 4
-    run: "cargo build --release --package k3-tokenizer"
+    run: "cargo build --release --package jero-tokenizer"

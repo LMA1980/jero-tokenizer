@@ -1,5 +1,5 @@
 version: "2"
-name: "k3-tokenizer Factory Pipeline: Hygiene, Tests, Coverage & Benchmarks"
+name: "jero-tokenizer Factory Pipeline: Hygiene, Tests, Coverage & Benchmarks"
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,11 +37,11 @@ stages:
     tags: ["k3"]
     depends_on: ["coverage-check"]
     threads: 2
-    run: "cargo +nightly miri test -p k3-tokenizer --lib"
+    run: "cargo +nightly miri test -p jero-tokenizer --lib"
 
   - id: bench-run
     name: "Execute Native Micro-Benchmarks (cargo bench)"
     tags: ["k3"]
     depends_on: ["coverage-check"]
     threads: 2
-    run: "cargo bench --package k3-tokenizer || true"
+    run: "cargo bench --package jero-tokenizer || true"
