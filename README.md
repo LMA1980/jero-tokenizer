@@ -21,9 +21,9 @@ Shared tokenizer and chat-template library for the SpacemiT K3 platform, integra
 `jero-tokenizer` provides decoupled tokenization, BPE merge parsing, streaming piece decoding, and chat-template formatting built on top of `jero-core`.
 
 ## Architecture & Specifications
-For master architecture and detailed component specifications, see the parent [model-runner](https://github.com/LMA1980/model-runner) repository:
-- Master Plan: [PLAN.md](https://github.com/LMA1980/model-runner/blob/main/PLAN.md)
-- Specs: [specs/runtime/](https://github.com/LMA1980/model-runner/tree/main/specs/runtime)
+For master architecture and detailed component specifications, see the parent [jero-runner](https://github.com/LMA1980/jero-runner) repository:
+- Master Plan: [PLAN.md](https://github.com/LMA1980/jero-runner/blob/main/PLAN.md)
+- Specs: [specs/runtime/](https://github.com/LMA1980/jero-runner/tree/main/specs/runtime)
 
 ## License
 
