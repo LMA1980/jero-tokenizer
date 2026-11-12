@@ -606,23 +606,25 @@ impl GgufTokenizer {
                 out.push(id);
                 cursor += len;
             } else {
-                // Fallback to `<0xXX>` byte token if available
-                let b = bytes[cursor];
-                if let Some(byte_id) = self.byte_tokens[usize::from(b)] {
-                    out.push(byte_id);
-                    cursor += 1;
-                } else if let Some(pad_id) = self.special_tokens.padding_token_id {
-                    out.push(pad_id);
-                    cursor += 1;
-                } else {
-                    let ch = remaining.chars().next().unwrap_or('\0');
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: "tokenizer".to_owned(),
-                        reason: format!(
-                            "unable to encode character '{ch}' (byte 0x{b:02X}) in segment '{segment}'"
-                        ),
-                    });
+                // Emit fallback byte token(s) across the complete UTF-8 scalar so `cursor`
+                // always remains on a valid UTF-8 character boundary.
+                let ch = remaining.chars().next().unwrap_or('\0');
+                let char_len = ch.len_utf8().min(remaining.len()).max(1);
+                for &b in &remaining.as_bytes()[..char_len] {
+                    if let Some(byte_id) = self.byte_tokens[usize::from(b)] {
+                        out.push(byte_id);
+                    } else if let Some(pad_id) = self.special_tokens.padding_token_id {
+                        out.push(pad_id);
+                    } else {
+                        return Err(K3Error::CapabilityMismatch {
+                            architecture: "tokenizer".to_owned(),
+                            reason: format!(
+                                "unable to encode character '{ch}' (byte 0x{b:02X}) in segment '{segment}'"
+                            ),
+                        });
+                    }
                 }
+                cursor += char_len;
             }
         }
 
@@ -1114,6 +1116,64 @@ mod tests {
         assert_eq!(
             low,
             "<s><|im_start|>user\nSolve 2+2<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
+    }
+
+    #[test]
+    fn test_encode_multibyte_utf8_byte_and_pad_fallback_preserves_char_boundaries() {
+        // 1. `<0xXX>` byte-fallback vocabulary: '’' (0xE2 0x80 0x99) and '🚀' (0xF0 0x9F 0x9A 0x80)
+        let tokens = vec![
+            "<pad>", "<bos>", "<eos>", "Janet", "s", " ", "ducks", "<0xE2>", "<0x80>", "<0x99>",
+            "<0xF0>", "<0x9F>", "<0x9A>",
+        ];
+        let token_types = vec![3, 3, 3, 1, 1, 1, 1, 6, 6, 6, 6, 6, 6];
+        let extra_kvs = [
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens)),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(token_types)),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                GgufValue::Array(GgufArray::String(Vec::new())),
+            ),
+            ("tokenizer.ggml.add_bos_token", GgufValue::Bool(false)),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs("synthetic", 32, &extra_kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse byte-fallback gguf");
+        let byte_tok = GgufTokenizer::from_gguf(&gguf).expect("load byte-fallback tokenizer");
+
+        let prompt = "Janet’s ducks 🚀";
+        let encoded = byte_tok
+            .encode(prompt)
+            .expect("multi-byte UTF-8 byte fallback must not panic");
+        assert_eq!(encoded, vec![3, 7, 8, 9, 4, 5, 6, 5, 10, 11, 12, 8]);
+
+        let mut detok = byte_tok.streaming_detokenizer();
+        let mut roundtrip = String::new();
+        for &tok_id in &encoded {
+            if let DetokenizeStep::Emit(piece) = detok.push_token(tok_id).expect("detok step") {
+                roundtrip.push_str(&piece);
+            }
+        }
+        roundtrip.push_str(&detok.finish());
+        assert_eq!(roundtrip, prompt);
+
+        // 2. `padding_token_id` fallback vocabulary (no `<0xXX>` tokens, as in synthetic fixtures)
+        let synthetic_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
+        let synthetic_gguf = GgufFile::parse(&synthetic_bytes).expect("parse synthetic gguf");
+        let pad_tok =
+            GgufTokenizer::from_gguf(&synthetic_gguf).expect("load synthetic pad tokenizer");
+
+        let pad_encoded = pad_tok
+            .encode("Janet’s — €100 🚀")
+            .expect("padding fallback across 3-byte and 4-byte scalars must not panic");
+        assert!(
+            !pad_encoded.is_empty(),
+            "encoded multi-byte prompt must produce non-empty token list"
         );
     }
 }
