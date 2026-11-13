@@ -102,6 +102,9 @@ impl ChatTemplate {
         if tmpl.contains("{{content}}") {
             return tmpl.replace("{{content}}", user_prompt);
         }
+        if tmpl.contains("<start_of_turn>") {
+            return self.format_gemma_prompt(user_prompt);
+        }
         if tmpl.contains("<|im_start|>") {
             return format!("<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n");
         }
@@ -126,6 +129,27 @@ impl ChatTemplate {
     ) -> String {
         format_dory_chatml_prompt(user_prompt, reasoning_effort, enable_thinking)
     }
+
+    /// Formats a prompt using the Gemma `SentencePiece` turn template
+    /// (`<start_of_turn>user\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n`).
+    #[must_use]
+    pub fn format_gemma_prompt(&self, user_prompt: &str) -> String {
+        let _ = self;
+        format_gemma_prompt(user_prompt)
+    }
+}
+
+/// Canonical Gemma beginning-of-sequence token string (`"<bos>"`).
+pub const GEMMA_BOS_TOKEN: &str = "<bos>";
+
+/// Canonical Gemma end-of-turn delimiter token string (`"<end_of_turn>"`).
+pub const GEMMA_EOT_TOKEN: &str = "<end_of_turn>";
+
+/// Formats a user prompt using the Gemma `SentencePiece` turn template
+/// (`<start_of_turn>user\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n`).
+#[must_use]
+pub fn format_gemma_prompt(user_prompt: &str) -> String {
+    format!("<start_of_turn>user\n{user_prompt}{GEMMA_EOT_TOKEN}\n<start_of_turn>model\n")
 }
 
 /// Canonical Dory1.0 beginning-of-sequence token string (`"<s>"`).
@@ -413,7 +437,17 @@ impl GgufTokenizer {
             .and_then(GgufValue::as_u32);
         let eot_token_id = gguf
             .metadata_value("tokenizer.ggml.eot_token_id")
-            .and_then(GgufValue::as_u32);
+            .and_then(GgufValue::as_u32)
+            .or_else(|| {
+                if matches!(
+                    model_type.as_str(),
+                    "gemma" | "gemma2" | "gemma3" | "gemma4"
+                ) {
+                    token_to_id.get(GEMMA_EOT_TOKEN).copied()
+                } else {
+                    None
+                }
+            });
         let padding_token_id = gguf
             .metadata_value("tokenizer.ggml.padding_token_id")
             .and_then(GgufValue::as_u32);
@@ -433,7 +467,13 @@ impl GgufTokenizer {
         }
 
         let mut stop_sequences = Vec::new();
-        for marker in ["<|im_end|>", "<|eot_id|>", "</s>", "<|endoftext|>"] {
+        for marker in [
+            "<|im_end|>",
+            "<|eot_id|>",
+            GEMMA_EOT_TOKEN,
+            "</s>",
+            "<|endoftext|>",
+        ] {
             if let Some(&id) = token_to_id.get(marker) {
                 if !stop_tokens.contains(&id) {
                     stop_tokens.push(id);
@@ -473,7 +513,14 @@ impl GgufTokenizer {
         })
     }
 
-    /// Returns the GGUF tokenizer model family (e.g. `"gpt2"`, `"llama"`).
+    fn is_sentencepiece_family(&self) -> bool {
+        matches!(
+            self.model_type.as_str(),
+            "llama" | "gemma" | "gemma2" | "gemma3" | "gemma4"
+        )
+    }
+
+    /// Returns the GGUF tokenizer model family (e.g. `"gpt2"`, `"llama"`, `"gemma3"`).
     #[must_use]
     pub fn model_type(&self) -> &str {
         &self.model_type
@@ -570,12 +617,29 @@ impl GgufTokenizer {
             return Ok(());
         }
 
-        // SentencePiece style space normalization if model_type is "llama" and vocab uses '▁'
+        // SentencePiece style space normalization for llama and Gemma model families when vocab uses '▁'
         let normalized;
-        let text_to_process = if self.model_type == "llama"
+        let text_to_process = if self.is_sentencepiece_family()
             && self.token_to_id.keys().any(|k| k.contains('\u{2581}'))
         {
-            normalized = segment.replace(' ', "\u{2581}");
+            let mut sp = segment.replace(' ', "\u{2581}");
+            let has_direct_prefix = (1..=sp.len())
+                .any(|i| sp.is_char_boundary(i) && self.token_to_id.contains_key(&sp[..i]));
+            if !sp.is_empty()
+                && !sp.starts_with('\u{2581}')
+                && !sp.starts_with('\n')
+                && !has_direct_prefix
+            {
+                let prefixed = format!("\u{2581}{sp}");
+                if self.token_to_id.keys().any(|k| {
+                    k.starts_with('\u{2581}')
+                        && k.len() > '\u{2581}'.len_utf8()
+                        && prefixed.starts_with(k.as_str())
+                }) {
+                    sp = prefixed;
+                }
+            }
+            normalized = sp;
             normalized.as_str()
         } else {
             segment
@@ -701,7 +765,7 @@ impl GgufTokenizer {
             return Ok(Some(vec![byte_val]));
         }
 
-        if self.model_type == "llama" && piece.contains('\u{2581}') {
+        if self.is_sentencepiece_family() && piece.contains('\u{2581}') {
             return Ok(Some(piece.replace('\u{2581}', " ").into_bytes()));
         }
 
@@ -932,6 +996,127 @@ impl<'a> StreamingDetokenizer<'a> {
             }
         }
     }
+}
+
+/// Incremental text chunk emitted while separating reasoning spans from visible output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThinkingDelta {
+    /// Text extracted from inside `<|think|>...<|/think|>` (Gemma 4) or `<think>...</think>`.
+    Thinking(String),
+    /// Visible assistant response text outside reasoning delimiters.
+    Content(String),
+}
+
+/// Stateful streaming parser separating `<|think|>...<|/think|>` (Gemma 4) and
+/// `<think>...</think>` (`Qwen3` / Dory1.0) reasoning blocks from visible response deltas.
+#[derive(Debug, Clone, Default)]
+pub struct ThinkingStreamExtractor {
+    in_thinking: bool,
+    buffer: String,
+    active_close_tag: Option<&'static str>,
+}
+
+impl ThinkingStreamExtractor {
+    const OPEN_TAGS: [(&'static str, &'static str); 2] =
+        [("<|think|>", "<|/think|>"), ("<think>", "</think>")];
+
+    /// Creates a new [`ThinkingStreamExtractor`] in the initial visible-content state.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            in_thinking: false,
+            buffer: String::new(),
+            active_close_tag: None,
+        }
+    }
+
+    /// Returns `true` when currently inside an active reasoning block.
+    #[must_use]
+    pub const fn is_in_thinking(&self) -> bool {
+        self.in_thinking
+    }
+
+    /// Feeds a streamed token or text chunk and returns all complete [`ThinkingDelta`] segments.
+    pub fn push(&mut self, chunk: &str) -> Vec<ThinkingDelta> {
+        self.buffer.push_str(chunk);
+        let mut deltas = Vec::new();
+
+        loop {
+            if self.in_thinking {
+                let close_tag = self.active_close_tag.unwrap_or("<|/think|>");
+                if let Some(idx) = self.buffer.find(close_tag) {
+                    if idx > 0 {
+                        deltas.push(ThinkingDelta::Thinking(self.buffer[..idx].to_owned()));
+                    }
+                    self.buffer.drain(..idx + close_tag.len());
+                    self.in_thinking = false;
+                    self.active_close_tag = None;
+                    continue;
+                }
+                let holdback = suffix_prefix_len(&self.buffer, &[close_tag]);
+                let emit_len = self.buffer.len().saturating_sub(holdback);
+                if emit_len > 0 {
+                    deltas.push(ThinkingDelta::Thinking(self.buffer[..emit_len].to_owned()));
+                    self.buffer.drain(..emit_len);
+                }
+                break;
+            }
+
+            let next_open = Self::OPEN_TAGS
+                .iter()
+                .filter_map(|&(open, close)| self.buffer.find(open).map(|idx| (idx, open, close)))
+                .min_by_key(|&(idx, _, _)| idx);
+
+            if let Some((idx, open_tag, close_tag)) = next_open {
+                if idx > 0 {
+                    deltas.push(ThinkingDelta::Content(self.buffer[..idx].to_owned()));
+                }
+                self.buffer.drain(..idx + open_tag.len());
+                self.in_thinking = true;
+                self.active_close_tag = Some(close_tag);
+                continue;
+            }
+
+            let holdback = suffix_prefix_len(&self.buffer, &["<|think|>", "<think>"]);
+            let emit_len = self.buffer.len().saturating_sub(holdback);
+            if emit_len > 0 {
+                deltas.push(ThinkingDelta::Content(self.buffer[..emit_len].to_owned()));
+                self.buffer.drain(..emit_len);
+            }
+            break;
+        }
+
+        deltas
+    }
+
+    /// Flushes any buffered trailing partial tag or text when the stream ends.
+    pub fn finish(&mut self) -> Vec<ThinkingDelta> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+        let tail = std::mem::take(&mut self.buffer);
+        self.active_close_tag = None;
+        if self.in_thinking {
+            self.in_thinking = false;
+            vec![ThinkingDelta::Thinking(tail)]
+        } else {
+            vec![ThinkingDelta::Content(tail)]
+        }
+    }
+}
+
+fn suffix_prefix_len(text: &str, tags: &[&str]) -> usize {
+    let mut best = 0usize;
+    for tag in tags {
+        for len in 1..tag.len() {
+            if let Some(prefix) = tag.get(..len) {
+                if text.ends_with(prefix) && len > best {
+                    best = len;
+                }
+            }
+        }
+    }
+    best
 }
 
 fn longest_stop_prefix_suffix(text: &str, stop_sequences: &[String]) -> usize {
@@ -1174,6 +1359,137 @@ mod tests {
         assert!(
             !pad_encoded.is_empty(),
             "encoded multi-byte prompt must produce non-empty token list"
+        );
+    }
+
+    #[test]
+    fn test_gemma_sentencepiece() {
+        let tokens = vec![
+            "<pad>",
+            "<bos>",
+            "<eos>",
+            "<start_of_turn>",
+            "<end_of_turn>",
+            "user",
+            "model",
+            "\n",
+            "hello",
+            "\u{2581}world",
+            "\u{2581}Gemma",
+            "<|think|>",
+            "<|/think|>",
+        ];
+        let token_types = vec![3, 3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 3, 3];
+        let extra_kvs = [
+            ("tokenizer.ggml.model", GgufValue::String("gemma3")),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens)),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(token_types)),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                GgufValue::Array(GgufArray::String(Vec::new())),
+            ),
+            ("tokenizer.ggml.add_bos_token", GgufValue::Bool(true)),
+            ("tokenizer.ggml.eot_token_id", GgufValue::Uint32(4)),
+            (
+                "tokenizer.chat_template",
+                GgufValue::String(
+                    "{% for m in messages %}<start_of_turn>{{ m.role }}\n{{ m.content }}<end_of_turn>\n{% endfor %}<start_of_turn>model\n",
+                ),
+            ),
+        ];
+
+        let bytes = create_synthetic_gguf_v3_with_kvs("gemma3", 32, &extra_kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse gemma3 gguf");
+        let tok = GgufTokenizer::from_gguf(&gguf).expect("load gemma3 tokenizer");
+
+        assert_eq!(tok.model_type(), "gemma3");
+        assert_eq!(tok.special_tokens().eot_token_id, Some(4));
+        assert!(tok.special_tokens().is_stop(4));
+
+        // 1. <start_of_turn> Jinja template routing
+        let formatted = tok.chat_template().format_prompt("hello world");
+        assert_eq!(
+            formatted,
+            "<start_of_turn>user\nhello world<end_of_turn>\n<start_of_turn>model\n"
+        );
+        assert_eq!(format_gemma_prompt("hello world"), formatted);
+
+        let prompt_ids = tok
+            .tokenize_prompt("hello world", true, 64)
+            .expect("tokenize gemma prompt");
+        assert_eq!(
+            prompt_ids,
+            vec![
+                1, // <bos>
+                3, // <start_of_turn>
+                5, // user
+                7, // \n
+                8, // hello
+                9, // ▁world
+                4, // <end_of_turn>
+                7, // \n
+                3, // <start_of_turn>
+                6, // model
+                7, // \n
+            ]
+        );
+
+        // 2. SentencePiece '▁' normalization on standalone prompt & leading-space roundtrip
+        let sp_ids = tok.encode("hello world").expect("encode hello world");
+        assert_eq!(sp_ids, vec![1, 8, 9]);
+        let decoded = tok.decode(&[8, 9]).expect("decode SentencePiece");
+        assert_eq!(decoded, "hello world");
+
+        let gemma_sp = tok.encode(" Gemma").expect("encode leading space Gemma");
+        assert_eq!(gemma_sp, vec![1, 10]);
+        assert_eq!(tok.decode(&[10]).expect("decode ▁Gemma"), " Gemma");
+
+        // 3. Streaming stops cleanly at <end_of_turn>
+        let mut detok = tok.streaming_detokenizer();
+        assert_eq!(
+            detok.push_token(8).expect("push hello"),
+            DetokenizeStep::Emit("hello".to_owned())
+        );
+        assert_eq!(
+            detok.push_token(4).expect("push <end_of_turn>"),
+            DetokenizeStep::Stop(String::new())
+        );
+        assert!(detok.is_stopped());
+    }
+
+    #[test]
+    fn test_gemma_thinking_stream_extractor() {
+        // Streaming <|think|>...<|/think|> and <think>...</think> extraction across chunk splits
+        let mut extractor = ThinkingStreamExtractor::new();
+        let mut deltas = Vec::new();
+        for chunk in [
+            "<|thi",
+            "nk|>step ",
+            "one<|/th",
+            "ink|>Answer",
+            " <th",
+            "ink>q</thi",
+            "nk>!",
+        ] {
+            deltas.extend(extractor.push(chunk));
+        }
+        deltas.extend(extractor.finish());
+        assert_eq!(
+            deltas,
+            vec![
+                ThinkingDelta::Thinking("step ".to_owned()),
+                ThinkingDelta::Thinking("one".to_owned()),
+                ThinkingDelta::Content("Answer".to_owned()),
+                ThinkingDelta::Content(" ".to_owned()),
+                ThinkingDelta::Thinking("q".to_owned()),
+                ThinkingDelta::Content("!".to_owned()),
+            ]
         );
     }
 }
