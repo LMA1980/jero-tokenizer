@@ -55,8 +55,11 @@ pub struct SpecialTokens {
     pub add_bos_token: bool,
     /// Explicit stop sequence token IDs.
     pub stop_tokens: Vec<u32>,
-    /// Text-level stop sequences (e.g., `"<|im_end|>"`, `"</s>"`).
+    /// Text-level stop sequences (e.g., `"<|im_end|>"`, `"</s>"`, `"<nexa_end>"`).
     pub stop_sequences: Vec<String>,
+    /// Learned functional action/tool-call token pairs `(token_text, token_id)` such as
+    /// `<nexa_0>..<nexa_k>`, `<nexa_end>`, `<start_function_call>`, and `<|tool_call|>`.
+    pub functional_tokens: Vec<(String, u32)>,
 }
 
 impl SpecialTokens {
@@ -102,6 +105,15 @@ impl ChatTemplate {
         if tmpl.contains("{{content}}") {
             return tmpl.replace("{{content}}", user_prompt);
         }
+        if tmpl.contains("<start_function_call>") {
+            return format_functiongemma_prompt(user_prompt);
+        }
+        if tmpl.contains("<nexa_") {
+            return format_octopus_prompt(user_prompt);
+        }
+        if tmpl.contains("<|tool_call|>") {
+            return format_xlam_prompt(user_prompt);
+        }
         if tmpl.contains("<start_of_turn>") {
             return self.format_gemma_prompt(user_prompt);
         }
@@ -137,6 +149,27 @@ impl ChatTemplate {
         let _ = self;
         format_gemma_prompt(user_prompt)
     }
+
+    /// Formats a prompt using the `FunctionGemma` turn template.
+    #[must_use]
+    pub fn format_functiongemma_prompt(&self, user_prompt: &str) -> String {
+        let _ = self;
+        format_functiongemma_prompt(user_prompt)
+    }
+
+    /// Formats a prompt using the `Octopus` functional-token prompt template.
+    #[must_use]
+    pub fn format_octopus_prompt(&self, user_prompt: &str) -> String {
+        let _ = self;
+        format_octopus_prompt(user_prompt)
+    }
+
+    /// Formats a prompt using the `xLAM` `ChatML` tool-calling template.
+    #[must_use]
+    pub fn format_xlam_prompt(&self, user_prompt: &str) -> String {
+        let _ = self;
+        format_xlam_prompt(user_prompt)
+    }
 }
 
 /// Canonical Gemma beginning-of-sequence token string (`"<bos>"`).
@@ -145,11 +178,66 @@ pub const GEMMA_BOS_TOKEN: &str = "<bos>";
 /// Canonical Gemma end-of-turn delimiter token string (`"<end_of_turn>"`).
 pub const GEMMA_EOT_TOKEN: &str = "<end_of_turn>";
 
+/// Canonical `Octopus` functional-action termination token string (`"<nexa_end>"`).
+pub const OCTOPUS_NEXA_END_TOKEN: &str = "<nexa_end>";
+
+/// Canonical `FunctionGemma` function-call start token string (`"<start_function_call>"`).
+pub const FUNCTION_GEMMA_CALL_START: &str = "<start_function_call>";
+
+/// Canonical `FunctionGemma` function-call end token string (`"<end_function_call>"`).
+pub const FUNCTION_GEMMA_CALL_END: &str = "<end_function_call>";
+
+/// Canonical `xLAM` tool-call sentinel token string (`"<|tool_call|>"`).
+pub const XLAM_TOOL_CALL_TOKEN: &str = "<|tool_call|>";
+
+/// Returns `true` if `token` is a recognized functional action/tool-call token marker
+/// (`<nexa_N>`, `<nexa_end>`, `<start_function_call>`, `<end_function_call>`,
+/// `<|tool_call|>`, `<tool_call>`, or `</tool_call>`).
+#[must_use]
+pub fn is_functional_action_token(token: &str) -> bool {
+    if matches!(
+        token,
+        OCTOPUS_NEXA_END_TOKEN
+            | FUNCTION_GEMMA_CALL_START
+            | FUNCTION_GEMMA_CALL_END
+            | XLAM_TOOL_CALL_TOKEN
+            | "<tool_call>"
+            | "</tool_call>"
+    ) {
+        return true;
+    }
+
+    token
+        .strip_prefix("<nexa_")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Formats a user prompt using the Gemma `SentencePiece` turn template
 /// (`<start_of_turn>user\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n`).
 #[must_use]
 pub fn format_gemma_prompt(user_prompt: &str) -> String {
     format!("<start_of_turn>user\n{user_prompt}{GEMMA_EOT_TOKEN}\n<start_of_turn>model\n")
+}
+
+/// Formats a user prompt using the `FunctionGemma` turn template.
+#[must_use]
+pub fn format_functiongemma_prompt(user_prompt: &str) -> String {
+    format!("<start_of_turn>user\n{user_prompt}{GEMMA_EOT_TOKEN}\n<start_of_turn>model\n")
+}
+
+/// Formats a user prompt using the `Octopus` functional-token query prompt format.
+#[must_use]
+pub fn format_octopus_prompt(user_prompt: &str) -> String {
+    format!(
+        "Below is the query from the users, please choose the correct function and generate the parameters to call the function.\nQuery: {user_prompt}\nResponse: "
+    )
+}
+
+/// Formats a user prompt using the `xLAM` `ChatML` tool-calling prompt template.
+#[must_use]
+pub fn format_xlam_prompt(user_prompt: &str) -> String {
+    format!("<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n")
 }
 
 /// Canonical Dory1.0 beginning-of-sequence token string (`"<s>"`).
@@ -409,6 +497,7 @@ impl GgufTokenizer {
         let mut token_to_id = HashMap::with_capacity(id_to_token.len());
         let mut byte_tokens = [None; 256];
         let mut control_tokens = Vec::new();
+        let mut functional_tokens = Vec::new();
 
         for (idx, text) in id_to_token.iter().enumerate() {
             let Ok(id) = u32::try_from(idx) else {
@@ -420,14 +509,20 @@ impl GgufTokenizer {
                 byte_tokens[usize::from(byte_val)] = Some(id);
             }
 
+            let is_func = is_functional_action_token(text);
+            if is_func {
+                functional_tokens.push((text.clone(), id));
+            }
+
             let ttype = token_types.get(idx).copied().unwrap_or(TokenType::Normal);
-            if ttype == TokenType::Control && !text.is_empty() {
+            if (ttype == TokenType::Control || is_func) && !text.is_empty() {
                 control_tokens.push((text.clone(), id));
             }
         }
 
         // Sort control tokens longest-first so greedy matching prefers longer markers
         control_tokens.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
+        functional_tokens.sort_by_key(|entry| entry.1);
 
         let bos_token_id = gguf
             .metadata_value("tokenizer.ggml.bos_token_id")
@@ -441,7 +536,7 @@ impl GgufTokenizer {
             .or_else(|| {
                 if matches!(
                     model_type.as_str(),
-                    "gemma" | "gemma2" | "gemma3" | "gemma4"
+                    "gemma" | "gemma2" | "gemma3" | "gemma4" | "functiongemma"
                 ) {
                     token_to_id.get(GEMMA_EOT_TOKEN).copied()
                 } else {
@@ -473,6 +568,8 @@ impl GgufTokenizer {
             GEMMA_EOT_TOKEN,
             "</s>",
             "<|endoftext|>",
+            OCTOPUS_NEXA_END_TOKEN,
+            FUNCTION_GEMMA_CALL_END,
         ] {
             if let Some(&id) = token_to_id.get(marker) {
                 if !stop_tokens.contains(&id) {
@@ -490,6 +587,7 @@ impl GgufTokenizer {
             add_bos_token,
             stop_tokens,
             stop_sequences,
+            functional_tokens,
         };
 
         let chat_template_str = gguf
@@ -1161,6 +1259,7 @@ mod tests {
             add_bos_token: true,
             stop_tokens: vec![2, 3],
             stop_sequences: Vec::new(),
+            functional_tokens: Vec::new(),
         });
 
         tokenizer.add_token("hello", 10);
@@ -1490,6 +1589,74 @@ mod tests {
                 ThinkingDelta::Thinking("q".to_owned()),
                 ThinkingDelta::Content("!".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_functional_special_token_extraction() {
+        let tokens = vec![
+            "<pad>",
+            "<bos>",
+            "<eos>",
+            "<nexa_0>",
+            "<nexa_1>",
+            "<nexa_2>",
+            "<nexa_end>",
+            "<start_function_call>",
+            "<end_function_call>",
+            "<|tool_call|>",
+            "hello",
+            "<nexa_bad>",
+        ];
+        // Deliberately mark <nexa_*> and <|tool_call|> as Normal (1) so extraction proves
+        // functional tokens are elevated to control/special handling even without type=3.
+        let token_types = vec![3, 3, 3, 1, 1, 1, 1, 3, 3, 1, 1, 1];
+        let extra_kvs = [
+            ("tokenizer.ggml.model", GgufValue::String("octopus")),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens)),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(token_types)),
+            ),
+        ];
+
+        let bytes = create_synthetic_gguf_v3_with_kvs("octopus", 32, &extra_kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse octopus gguf");
+        let tok = GgufTokenizer::from_gguf(&gguf).expect("load octopus tokenizer");
+
+        assert_eq!(
+            tok.special_tokens().functional_tokens,
+            vec![
+                ("<nexa_0>".to_owned(), 3),
+                ("<nexa_1>".to_owned(), 4),
+                ("<nexa_2>".to_owned(), 5),
+                ("<nexa_end>".to_owned(), 6),
+                ("<start_function_call>".to_owned(), 7),
+                ("<end_function_call>".to_owned(), 8),
+                ("<|tool_call|>".to_owned(), 9),
+            ]
+        );
+        assert!(!is_functional_action_token("<nexa_bad>"));
+        assert!(!is_functional_action_token("<nexa_>"));
+        assert!(tok.special_tokens().is_stop(6));
+        assert!(tok.special_tokens().is_stop(8));
+
+        let encoded = tok
+            .encode("<nexa_0>hello<|tool_call|><start_function_call><nexa_end>")
+            .expect("encode functional tokens");
+        assert_eq!(encoded, vec![1, 3, 10, 9, 7, 6]);
+
+        assert_eq!(
+            format_functiongemma_prompt("check status"),
+            "<start_of_turn>user\ncheck status<end_of_turn>\n<start_of_turn>model\n"
+        );
+        assert!(format_octopus_prompt("turn on lights").contains("Query: turn on lights"));
+        assert_eq!(
+            format_xlam_prompt("get weather"),
+            "<|im_start|>user\nget weather<|im_end|>\n<|im_start|>assistant\n"
         );
     }
 }
