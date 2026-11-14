@@ -4,9 +4,20 @@
 //! `k3-manager` per ADR-025 without dragging in engine compute or hardware
 //! affinity dependencies.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use jero_core::{GgufArray, GgufFile, GgufValue, K3Error};
+
+mod gpt2_bpe;
+mod pretokenizer;
+mod unigram;
+
+pub use gpt2_bpe::{
+    GPT2_BYTE_TO_CHAR, gpt2_byte_to_char, gpt2_bytes_to_unicode, gpt2_char_to_byte,
+    gpt2_piece_to_raw_bytes, gpt2_unicode_to_bytes,
+};
+pub use pretokenizer::{PreTokenizerKind, split_pretokens};
 
 /// GGUF token type classification (`tokenizer.ggml.token_type`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +81,12 @@ impl SpecialTokens {
             return true;
         }
         self.stop_tokens.contains(&token_id)
+    }
+
+    /// Checks if a given token ID is considered a sequence stop token (alias for [`Self::is_stop`]).
+    #[must_use]
+    pub fn is_stop_token(&self, token_id: u32) -> bool {
+        self.is_stop(token_id)
     }
 }
 
@@ -989,6 +1006,12 @@ impl Tokenizer for SimpleTokenizer {
 #[derive(Debug, Clone)]
 pub struct GgufTokenizer {
     model_type: String,
+    pre_tokenizer: PreTokenizerKind,
+    uses_gpt2_byte_level: bool,
+    add_space_prefix: bool,
+    has_scores: bool,
+    max_token_byte_len: usize,
+    min_vocab_score: f64,
     id_to_token: Vec<String>,
     token_to_id: HashMap<String, u32>,
     scores: Vec<f32>,
@@ -1044,12 +1067,12 @@ impl GgufTokenizer {
             });
         }
 
-        let scores: Vec<f32> = match gguf
+        let (scores, has_scores) = match gguf
             .metadata_value("tokenizer.ggml.scores")
             .and_then(GgufValue::as_array)
         {
-            Some(GgufArray::Float32(vals)) => vals.clone(),
-            _ => vec![0.0_f32; id_to_token.len()],
+            Some(GgufArray::Float32(vals)) => (vals.clone(), vals.iter().any(|&s| s != 0.0)),
+            _ => (vec![0.0_f32; id_to_token.len()], false),
         };
 
         let token_types: Vec<TokenType> = match gguf
@@ -1140,34 +1163,55 @@ impl GgufTokenizer {
             .metadata_value("tokenizer.ggml.add_bos_token")
             .and_then(GgufValue::as_bool)
             .unwrap_or_else(|| model_type == "llama");
+        let add_space_prefix = gguf
+            .metadata_value("tokenizer.ggml.add_space_prefix")
+            .and_then(GgufValue::as_bool)
+            .unwrap_or_else(|| model_type == "llama" && !arch.starts_with("gemma"));
 
-        let mut stop_tokens = Vec::new();
-        if let Some(eos) = eos_token_id {
-            stop_tokens.push(eos);
-        }
-        if let Some(eot) = eot_token_id {
-            if !stop_tokens.contains(&eot) {
-                stop_tokens.push(eot);
-            }
-        }
+        let explicit_pre = PreTokenizerKind::from_gguf_pre(
+            gguf.metadata_value("tokenizer.ggml.pre")
+                .and_then(GgufValue::as_str),
+        );
+        let is_sp = is_sentencepiece_model_type(&model_type);
+        let has_gpt2_shifted = id_to_token
+            .iter()
+            .any(|t| t.chars().any(gpt2_bpe::is_gpt2_shifted_char));
+        let uses_gpt2_byte_level = !is_sp
+            && matches!(model_type.as_str(), "gpt2" | "bpe")
+            && (has_gpt2_shifted || (explicit_pre.is_some() && !token_to_id.contains_key(" ")));
+        let pre_tokenizer = explicit_pre.unwrap_or(if uses_gpt2_byte_level {
+            PreTokenizerKind::DefaultGpt2
+        } else {
+            PreTokenizerKind::None
+        });
 
-        let mut stop_sequences = Vec::new();
-        for marker in [
-            "<|im_end|>",
-            "<|eot_id|>",
-            GEMMA_EOT_TOKEN,
-            "</s>",
-            "<|endoftext|>",
-            OCTOPUS_NEXA_END_TOKEN,
-            FUNCTION_GEMMA_CALL_END,
-        ] {
-            if let Some(&id) = token_to_id.get(marker) {
-                if !stop_tokens.contains(&id) {
-                    stop_tokens.push(id);
-                }
-            }
-            stop_sequences.push(marker.to_owned());
-        }
+        let max_token_byte_len = id_to_token
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                token_types.get(*i).copied().unwrap_or(TokenType::Normal) == TokenType::Normal
+            })
+            .map(|(_, t)| t.len())
+            .max()
+            .unwrap_or(0);
+        let min_vocab_score = scores
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                s.is_finite()
+                    && token_types.get(*i).copied().unwrap_or(TokenType::Normal)
+                        == TokenType::Normal
+            })
+            .map(|(_, s)| f64::from(*s))
+            .fold(0.0_f64, f64::min);
+
+        let (stop_tokens, stop_sequences) = extract_stop_tokens_and_sequences(
+            gguf,
+            &token_to_id,
+            &token_types,
+            eos_token_id,
+            eot_token_id,
+        );
 
         let special_tokens = SpecialTokens {
             bos_token_id,
@@ -1188,6 +1232,12 @@ impl GgufTokenizer {
 
         Ok(Self {
             model_type,
+            pre_tokenizer,
+            uses_gpt2_byte_level,
+            add_space_prefix,
+            has_scores,
+            max_token_byte_len,
+            min_vocab_score,
             id_to_token,
             token_to_id,
             scores,
@@ -1202,16 +1252,31 @@ impl GgufTokenizer {
     }
 
     fn is_sentencepiece_family(&self) -> bool {
-        matches!(
-            self.model_type.as_str(),
-            "llama" | "gemma" | "gemma2" | "gemma3" | "gemma4"
-        )
+        is_sentencepiece_model_type(&self.model_type)
     }
 
     /// Returns the GGUF tokenizer model family (e.g. `"gpt2"`, `"llama"`, `"gemma3"`).
     #[must_use]
     pub fn model_type(&self) -> &str {
         &self.model_type
+    }
+
+    /// Returns the active pre-tokenizer profile parsed from `tokenizer.ggml.pre`.
+    #[must_use]
+    pub const fn pre_tokenizer(&self) -> PreTokenizerKind {
+        self.pre_tokenizer
+    }
+
+    /// Returns `true` if `SentencePiece` dummy space prefixing (`tokenizer.ggml.add_space_prefix`) is enabled.
+    #[must_use]
+    pub const fn add_space_prefix(&self) -> bool {
+        self.add_space_prefix
+    }
+
+    /// Returns `true` when this tokenizer maps raw bytes through GPT-2's `bytes_to_unicode` table.
+    #[must_use]
+    pub const fn uses_gpt2_byte_level(&self) -> bool {
+        self.uses_gpt2_byte_level
     }
 
     /// Returns the total vocabulary size.
@@ -1300,53 +1365,121 @@ impl GgufTokenizer {
             return Ok(());
         }
 
-        // Fast path: exact match in vocabulary
+        // 1. Pre-tokenized BPE / GPT-2 byte-level encoding path.
+        if self.pre_tokenizer != PreTokenizerKind::None || self.uses_gpt2_byte_level {
+            let effective_pre = if self.pre_tokenizer == PreTokenizerKind::None {
+                PreTokenizerKind::DefaultGpt2
+            } else {
+                self.pre_tokenizer
+            };
+            for pre_tok in split_pretokens(effective_pre, segment) {
+                self.encode_bpe_pretoken(pre_tok, segment, out)?;
+            }
+            return Ok(());
+        }
+
+        // 2. SentencePiece / Unigram normalization path (`▁` space replacement & dummy prefix).
+        let has_sp_markers = self.token_to_id.keys().any(|k| k.contains('\u{2581}'));
+        let use_unigram_viterbi =
+            self.has_scores && self.merge_ranks.is_empty() && self.is_sentencepiece_family();
+
+        if self.is_sentencepiece_family() && (has_sp_markers || use_unigram_viterbi) {
+            let mut sp = segment.replace(' ', "\u{2581}");
+            if self.add_space_prefix
+                && !sp.is_empty()
+                && !sp.starts_with('\u{2581}')
+                && !sp.starts_with('\n')
+            {
+                let prefixed = format!("\u{2581}{sp}");
+                if self.token_to_id.contains_key("\u{2581}")
+                    || self.token_to_id.keys().any(|k| {
+                        k.starts_with('\u{2581}')
+                            && k.len() > '\u{2581}'.len_utf8()
+                            && prefixed.starts_with(k.as_str())
+                    })
+                {
+                    sp = prefixed;
+                }
+            }
+
+            if use_unigram_viterbi {
+                let ids = unigram::encode_unigram_viterbi(
+                    &sp,
+                    segment,
+                    unigram::UnigramVocab {
+                        token_to_id: &self.token_to_id,
+                        scores: &self.scores,
+                        token_types: &self.token_types,
+                        byte_tokens: &self.byte_tokens,
+                        max_token_byte_len: self.max_token_byte_len,
+                        min_vocab_score: self.min_vocab_score,
+                    },
+                )?;
+                out.extend(ids);
+                return Ok(());
+            }
+
+            if let Some(&id) = self.token_to_id.get(sp.as_str()) {
+                out.push(id);
+                return Ok(());
+            }
+            if !self.merge_ranks.is_empty() && self.try_bpe_encode(&sp, out) {
+                return Ok(());
+            }
+            return self.encode_greedy_with_byte_fallback(&sp, segment, false, out);
+        }
+
+        // 3. Literal / legacy fallback path (synthetic vocabs without GPT-2 byte shifting or SPM).
         if let Some(&id) = self.token_to_id.get(segment) {
             out.push(id);
             return Ok(());
         }
-
-        // SentencePiece style space normalization for llama and Gemma model families when vocab uses '▁'
-        let normalized;
-        let text_to_process = if self.is_sentencepiece_family()
-            && self.token_to_id.keys().any(|k| k.contains('\u{2581}'))
-        {
-            let mut sp = segment.replace(' ', "\u{2581}");
-            let has_direct_prefix = (1..=sp.len())
-                .any(|i| sp.is_char_boundary(i) && self.token_to_id.contains_key(&sp[..i]));
-            if !sp.is_empty()
-                && !sp.starts_with('\u{2581}')
-                && !sp.starts_with('\n')
-                && !has_direct_prefix
-            {
-                let prefixed = format!("\u{2581}{sp}");
-                if self.token_to_id.keys().any(|k| {
-                    k.starts_with('\u{2581}')
-                        && k.len() > '\u{2581}'.len_utf8()
-                        && prefixed.starts_with(k.as_str())
-                }) {
-                    sp = prefixed;
-                }
-            }
-            normalized = sp;
-            normalized.as_str()
-        } else {
-            segment
-        };
-
-        // If BPE merges are configured, attempt BPE merge encoding on words/whitespace chunks
-        if !self.merge_ranks.is_empty() && self.try_bpe_encode(text_to_process, out) {
+        if !self.merge_ranks.is_empty() && self.try_bpe_encode(segment, out) {
             return Ok(());
         }
+        self.encode_greedy_with_byte_fallback(segment, segment, false, out)
+    }
 
-        // Greedy longest-prefix match in vocabulary with byte-token fallback
+    fn encode_bpe_pretoken(
+        &self,
+        pre_tok: &str,
+        raw_segment: &str,
+        out: &mut Vec<u32>,
+    ) -> Result<(), K3Error> {
+        let piece: Cow<'_, str> = if self.uses_gpt2_byte_level {
+            Cow::Owned(gpt2_bytes_to_unicode(pre_tok.as_bytes()))
+        } else {
+            Cow::Borrowed(pre_tok)
+        };
+
+        if let Some(&id) = self.token_to_id.get(piece.as_ref()) {
+            out.push(id);
+            return Ok(());
+        }
+        if !self.merge_ranks.is_empty() && self.try_bpe_encode(piece.as_ref(), out) {
+            return Ok(());
+        }
+        self.encode_greedy_with_byte_fallback(
+            piece.as_ref(),
+            raw_segment,
+            self.uses_gpt2_byte_level,
+            out,
+        )
+    }
+
+    fn encode_greedy_with_byte_fallback(
+        &self,
+        text_to_process: &str,
+        raw_segment: &str,
+        gpt2_mapped: bool,
+        out: &mut Vec<u32>,
+    ) -> Result<(), K3Error> {
         let mut cursor = 0usize;
         let bytes = text_to_process.as_bytes();
         while cursor < bytes.len() {
             let remaining = &text_to_process[cursor..];
             let mut matched: Option<(usize, u32)> = None;
 
-            // Find the longest prefix of `remaining` present in `token_to_id`
             for (char_idx, ch) in remaining.char_indices() {
                 let end = char_idx + ch.len_utf8();
                 let candidate = &remaining[..end];
@@ -1359,10 +1492,24 @@ impl GgufTokenizer {
                 out.push(id);
                 cursor += len;
             } else {
-                // Emit fallback byte token(s) across the complete UTF-8 scalar so `cursor`
-                // always remains on a valid UTF-8 character boundary.
                 let ch = remaining.chars().next().unwrap_or('\0');
                 let char_len = ch.len_utf8().min(remaining.len()).max(1);
+                if gpt2_mapped {
+                    if let Some(raw_byte) = gpt2_char_to_byte(ch) {
+                        if let Some(byte_id) = self.byte_tokens[usize::from(raw_byte)] {
+                            out.push(byte_id);
+                            cursor += char_len;
+                            continue;
+                        }
+                        let display_ch = char::from(raw_byte);
+                        return Err(K3Error::CapabilityMismatch {
+                            architecture: "tokenizer".to_owned(),
+                            reason: format!(
+                                "unable to encode character '{display_ch}' (byte 0x{raw_byte:02X}) in segment '{raw_segment}'"
+                            ),
+                        });
+                    }
+                }
                 for &b in &remaining.as_bytes()[..char_len] {
                     if let Some(byte_id) = self.byte_tokens[usize::from(b)] {
                         out.push(byte_id);
@@ -1370,7 +1517,7 @@ impl GgufTokenizer {
                         return Err(K3Error::CapabilityMismatch {
                             architecture: "tokenizer".to_owned(),
                             reason: format!(
-                                "unable to encode character '{ch}' (byte 0x{b:02X}) in segment '{segment}'"
+                                "unable to encode character '{ch}' (byte 0x{b:02X}) in segment '{raw_segment}'"
                             ),
                         });
                     }
@@ -1383,34 +1530,10 @@ impl GgufTokenizer {
     }
 
     fn try_bpe_encode(&self, text: &str, out: &mut Vec<u32>) -> bool {
-        let mut symbols: Vec<String> = text.chars().map(|c| c.to_string()).collect();
-        if symbols.is_empty() {
+        if text.is_empty() {
             return true;
         }
-
-        loop {
-            if symbols.len() < 2 {
-                break;
-            }
-
-            let mut best_pair: Option<(usize, usize)> = None; // (rank, index)
-            for i in 0..(symbols.len() - 1) {
-                let pair = (symbols[i].clone(), symbols[i + 1].clone());
-                if let Some(&rank) = self.merge_ranks.get(&pair) {
-                    if best_pair.is_none_or(|(best_rank, _)| rank < best_rank) {
-                        best_pair = Some((rank, i));
-                    }
-                }
-            }
-
-            let Some((_, idx)) = best_pair else {
-                break;
-            };
-
-            let merged = format!("{}{}", symbols[idx], symbols[idx + 1]);
-            symbols[idx] = merged;
-            symbols.remove(idx + 1);
-        }
+        let symbols = gpt2_bpe::bpe_merge_priority(text, &self.merge_ranks);
 
         let mut staged = Vec::with_capacity(symbols.len());
         for sym in &symbols {
@@ -1450,6 +1573,10 @@ impl GgufTokenizer {
 
         if let Some(byte_val) = parse_hex_byte_token(piece) {
             return Ok(Some(vec![byte_val]));
+        }
+
+        if self.uses_gpt2_byte_level {
+            return Ok(Some(gpt2_piece_to_raw_bytes(piece)));
         }
 
         if self.is_sentencepiece_family() && piece.contains('\u{2581}') {
@@ -1555,6 +1682,7 @@ pub struct StreamingDetokenizer<'a> {
     tokenizer: &'a GgufTokenizer,
     pending_utf8_bytes: Vec<u8>,
     pending_text: String,
+    at_stream_start: bool,
     stopped: bool,
 }
 
@@ -1566,6 +1694,7 @@ impl<'a> StreamingDetokenizer<'a> {
             tokenizer,
             pending_utf8_bytes: Vec::new(),
             pending_text: String::new(),
+            at_stream_start: true,
             stopped: false,
         }
     }
@@ -1578,8 +1707,10 @@ impl<'a> StreamingDetokenizer<'a> {
 
     /// Feeds the next generated `token_id` into the incremental detokenizer.
     ///
-    /// Buffers incomplete UTF-8 multi-byte sequences across token boundaries without emitting
-    /// `U+FFFD` replacement characters, and halts cleanly on token or text stop sequences.
+    /// Buffers incomplete UTF-8 multi-byte sequences across token boundaries, replaces genuinely
+    /// invalid byte sequences with `U+FFFD`, strips a single synthetic `SentencePiece` dummy space
+    /// at stream start when `add_space_prefix` is active, and halts cleanly on token or text stop
+    /// sequences.
     ///
     /// # Errors
     ///
@@ -1603,8 +1734,10 @@ impl<'a> StreamingDetokenizer<'a> {
             return Ok(DetokenizeStep::Hold);
         }
 
-        // 3. Extract complete UTF-8 characters from `pending_utf8_bytes`
+        // 3. Extract complete UTF-8 characters from `pending_utf8_bytes` and strip one leading
+        // SentencePiece dummy space if enabled at stream start.
         self.drain_valid_utf8();
+        self.consume_stream_start_dummy_space();
 
         if self.pending_text.is_empty() {
             return Ok(DetokenizeStep::Hold);
@@ -1649,11 +1782,29 @@ impl<'a> StreamingDetokenizer<'a> {
         }
     }
 
-    /// Flushes any remaining held-back text at the end of generation.
+    /// Flushes any remaining held-back text at the end of generation, emitting `U+FFFD` if an
+    /// incomplete multi-byte UTF-8 sequence remained truncated at EOF.
     #[must_use]
     pub fn finish(&mut self) -> String {
         self.drain_valid_utf8();
+        if !self.pending_utf8_bytes.is_empty() {
+            self.pending_utf8_bytes.clear();
+            self.pending_text.push('\u{FFFD}');
+        }
+        self.consume_stream_start_dummy_space();
         core::mem::take(&mut self.pending_text)
+    }
+
+    fn consume_stream_start_dummy_space(&mut self) {
+        if !self.at_stream_start || self.pending_text.is_empty() {
+            return;
+        }
+        if self.tokenizer.add_space_prefix() {
+            if let Some(stripped) = self.pending_text.strip_prefix(' ') {
+                self.pending_text = stripped.to_owned();
+            }
+        }
+        self.at_stream_start = false;
     }
 
     fn drain_valid_utf8(&mut self) {
@@ -1679,8 +1830,9 @@ impl<'a> StreamingDetokenizer<'a> {
                     }
 
                     if let Some(invalid_len) = err.error_len() {
-                        // Skip genuinely invalid UTF-8 byte sequence without emitting U+FFFD
+                        // Replace genuinely malformed UTF-8 byte sequence with U+FFFD and continue.
                         self.pending_utf8_bytes.drain(..invalid_len);
+                        self.pending_text.push('\u{FFFD}');
                     } else {
                         // Incomplete multi-byte UTF-8 sequence at end of buffer; wait for next token
                         break;
@@ -1827,6 +1979,91 @@ fn longest_stop_prefix_suffix(text: &str, stop_sequences: &[String]) -> usize {
         }
     }
     max_holdback
+}
+
+fn is_sentencepiece_model_type(model_type: &str) -> bool {
+    matches!(
+        model_type,
+        "llama" | "ugm" | "gemma" | "gemma2" | "gemma3" | "gemma4"
+    )
+}
+
+fn push_unique_stop_id(stop_tokens: &mut Vec<u32>, id: u32) {
+    if !stop_tokens.contains(&id) {
+        stop_tokens.push(id);
+    }
+}
+
+fn extract_stop_tokens_and_sequences(
+    gguf: &GgufFile<'_>,
+    token_to_id: &HashMap<String, u32>,
+    token_types: &[TokenType],
+    eos_token_id: Option<u32>,
+    turn_end_token_id: Option<u32>,
+) -> (Vec<u32>, Vec<String>) {
+    let mut stop_tokens = Vec::new();
+    if let Some(eos) = eos_token_id {
+        push_unique_stop_id(&mut stop_tokens, eos);
+    }
+    if let Some(eot) = turn_end_token_id {
+        push_unique_stop_id(&mut stop_tokens, eot);
+    }
+
+    if let Some(eos_arr) = gguf
+        .metadata_value("tokenizer.ggml.eos_token_ids")
+        .and_then(GgufValue::as_array)
+    {
+        match eos_arr {
+            GgufArray::Uint32(ids) => {
+                for &id in ids {
+                    push_unique_stop_id(&mut stop_tokens, id);
+                }
+            }
+            GgufArray::Int32(ids) => {
+                for &raw in ids {
+                    if let Ok(id) = u32::try_from(raw) {
+                        push_unique_stop_id(&mut stop_tokens, id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut stop_sequences = Vec::new();
+    for marker in [
+        "<|im_end|>",
+        "<|eot_id|>",
+        "<|eom_id|>",
+        "<|end|>",
+        GEMMA_EOT_TOKEN,
+        "</s>",
+        "<|endoftext|>",
+        "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>",
+        OCTOPUS_NEXA_END_TOKEN,
+        FUNCTION_GEMMA_CALL_END,
+    ] {
+        if let Some(&id) = token_to_id.get(marker) {
+            push_unique_stop_id(&mut stop_tokens, id);
+        }
+        if !stop_sequences.iter().any(|s| s == marker) {
+            stop_sequences.push(marker.to_owned());
+        }
+    }
+
+    if let Some(&assistant_id) = token_to_id.get("<|assistant|>") {
+        let ttype = usize::try_from(assistant_id)
+            .ok()
+            .and_then(|idx| token_types.get(idx).copied())
+            .unwrap_or(TokenType::Normal);
+        if matches!(ttype, TokenType::Control | TokenType::UserDefined) {
+            push_unique_stop_id(&mut stop_tokens, assistant_id);
+        }
+    }
+
+    stop_tokens.sort_unstable();
+    stop_tokens.dedup();
+    (stop_tokens, stop_sequences)
 }
 
 fn parse_hex_byte_token(token: &str) -> Option<u8> {
@@ -2455,6 +2692,10 @@ mod tests {
                     buf.extend_from_slice(&4_u32.to_le_bytes());
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
+                GgufValue::Bool(v) => {
+                    buf.extend_from_slice(&7_u32.to_le_bytes());
+                    buf.push(u8::from(*v));
+                }
                 GgufValue::String(s) => {
                     buf.extend_from_slice(&8_u32.to_le_bytes());
                     write_str(&mut buf, s);
@@ -2471,6 +2712,24 @@ mod tests {
                 GgufValue::Array(GgufArray::Int32(items)) => {
                     buf.extend_from_slice(&9_u32.to_le_bytes());
                     buf.extend_from_slice(&5_u32.to_le_bytes());
+                    let count = u64::try_from(items.len()).expect("array len fits u64");
+                    buf.extend_from_slice(&count.to_le_bytes());
+                    for item in items {
+                        buf.extend_from_slice(&item.to_le_bytes());
+                    }
+                }
+                GgufValue::Array(GgufArray::Uint32(items)) => {
+                    buf.extend_from_slice(&9_u32.to_le_bytes());
+                    buf.extend_from_slice(&4_u32.to_le_bytes());
+                    let count = u64::try_from(items.len()).expect("array len fits u64");
+                    buf.extend_from_slice(&count.to_le_bytes());
+                    for item in items {
+                        buf.extend_from_slice(&item.to_le_bytes());
+                    }
+                }
+                GgufValue::Array(GgufArray::Float32(items)) => {
+                    buf.extend_from_slice(&9_u32.to_le_bytes());
+                    buf.extend_from_slice(&6_u32.to_le_bytes());
                     let count = u64::try_from(items.len()).expect("array len fits u64");
                     buf.extend_from_slice(&count.to_le_bytes());
                     for item in items {
@@ -2667,5 +2926,469 @@ mod tests {
             .encode("hi 🚀")
             .expect_err("missing byte token must return CapabilityMismatch");
         assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
+    }
+
+    fn gpt2_base_vocab_with_extras(extras: &[(&str, i32)]) -> (Vec<String>, Vec<i32>) {
+        let mut tokens = Vec::with_capacity(256 + extras.len());
+        let mut types = Vec::with_capacity(256 + extras.len());
+        for &(tok, ty) in extras {
+            tokens.push(tok.to_owned());
+            types.push(ty);
+        }
+        for byte in 0_u8..=u8::MAX {
+            tokens.push(gpt2_byte_to_char(byte).to_string());
+            types.push(1);
+        }
+        (tokens, types)
+    }
+
+    fn naive_bpe_reference(text: &str, merges: &[(&str, &str)]) -> Vec<String> {
+        let mut ranks: HashMap<(&str, &str), usize> = HashMap::with_capacity(merges.len());
+        for (rank, &(left, right)) in merges.iter().enumerate() {
+            ranks.insert((left, right), rank);
+        }
+        let mut parts: Vec<String> = text.chars().map(|ch| ch.to_string()).collect();
+        while parts.len() >= 2 {
+            let mut best: Option<(usize, usize)> = None;
+            for idx in 0..(parts.len() - 1) {
+                if let Some(&rank) = ranks.get(&(parts[idx].as_str(), parts[idx + 1].as_str()))
+                    && best.is_none_or(|(best_rank, best_idx)| (rank, idx) < (best_rank, best_idx))
+                {
+                    best = Some((rank, idx));
+                }
+            }
+            let Some((_, idx)) = best else {
+                break;
+            };
+            let right = parts.remove(idx + 1);
+            parts[idx].push_str(&right);
+        }
+        parts
+    }
+
+    #[test]
+    fn test_gpt2_byte_to_unicode_256_roundtrip() {
+        assert_eq!(GPT2_BYTE_TO_CHAR.len(), 256);
+        let mut seen = std::collections::HashSet::with_capacity(256);
+        for byte in 0_u8..=u8::MAX {
+            let ch = gpt2_byte_to_char(byte);
+            assert!(seen.insert(ch), "duplicate unicode char for byte {byte}");
+            assert_eq!(gpt2_char_to_byte(ch), Some(byte));
+        }
+        assert_eq!(gpt2_byte_to_char(b' '), '\u{0120}'); // 'Ġ'
+        assert_eq!(gpt2_byte_to_char(b'\n'), '\u{010A}'); // 'Ċ'
+        assert_eq!(gpt2_byte_to_char(b'\t'), '\u{0109}'); // 'ĉ'
+        assert_eq!(gpt2_char_to_byte('α'), None);
+
+        let all_bytes: Vec<u8> = (0_u8..=u8::MAX).collect();
+        let encoded = gpt2_bytes_to_unicode(&all_bytes);
+        let decoded = gpt2_unicode_to_bytes(&encoded).expect("all 256 bytes roundtrip");
+        assert_eq!(decoded, all_bytes);
+
+        let text = "🚀 café 日本語\n\t ";
+        let mapped = gpt2_bytes_to_unicode(text.as_bytes());
+        assert!(mapped.contains('\u{0120}'));
+        assert!(mapped.contains('\u{010A}'));
+        let raw = gpt2_unicode_to_bytes(&mapped).expect("roundtrip UTF-8 bytes");
+        assert_eq!(String::from_utf8(raw).expect("valid utf8"), text);
+        assert_eq!(gpt2_unicode_to_bytes("helloα"), Err('α'));
+    }
+
+    #[test]
+    fn test_gpt2_byte_level_gguf_encode_decode_and_streaming() {
+        let extras = [
+            ("<pad>", 3),
+            ("<|begin_of_text|>", 3),
+            ("<|eot_id|>", 3),
+            ("<|start_header_id|>", 3),
+            ("<|end_header_id|>", 3),
+            ("user", 1),
+            ("assistant", 1),
+            ("\u{0120}hi", 1),
+            ("\u{010A}\u{010A}", 1),
+        ];
+        let (tokens, token_types) = gpt2_base_vocab_with_extras(&extras);
+        let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let merges = vec![
+            "u s",
+            "us e",
+            "use r",
+            "a s",
+            "as s",
+            "ass i",
+            "assi s",
+            "assis t",
+            "assist a",
+            "assista n",
+            "assistan t",
+            "\u{0120} h",
+            "\u{0120}h i",
+            "\u{010A} \u{010A}",
+        ];
+        let llama3_tpl = "{% for m in messages %}<|start_header_id|>{{ m['role'] }}<|end_header_id|>\n\n{{ m['content'] }}<|eot_id|>{% endfor %}";
+        let bytes = build_minimal_gguf_v3(&[
+            ("general.architecture", GgufValue::String("llama")),
+            ("tokenizer.ggml.model", GgufValue::String("gpt2")),
+            ("tokenizer.ggml.pre", GgufValue::String("llama3")),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(token_refs)),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(token_types)),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                GgufValue::Array(GgufArray::String(merges)),
+            ),
+            ("tokenizer.ggml.padding_token_id", GgufValue::Uint32(0)),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(2)),
+            ("tokenizer.chat_template", GgufValue::String(llama3_tpl)),
+        ]);
+        let gguf = GgufFile::parse(&bytes).expect("parse gpt2 llama3 gguf");
+        let tok = GgufTokenizer::from_gguf(&gguf).expect("load gpt2 tokenizer");
+        assert!(tok.uses_gpt2_byte_level());
+        assert_eq!(tok.pre_tokenizer(), PreTokenizerKind::Llama3);
+        assert!(tok.special_tokens().is_stop_token(2));
+
+        // Multi-byte UTF-8 emojis + newlines + leading spaces must never fall back to pad ID 0.
+        let sample = " hi\n\n🚀";
+        let ids = tok.encode(sample).expect("encode multi-byte prompt");
+        assert!(
+            !ids.contains(&0),
+            "must never fall back to padding_token_id"
+        );
+        assert_eq!(tok.decode(&ids).expect("decode roundtrip"), sample);
+
+        // Stream the 4 GPT-2 byte tokens representing 🚀 one token at a time.
+        let mut streamer = tok.streaming_detokenizer();
+        let rocket_ids: Vec<u32> = "🚀"
+            .as_bytes()
+            .iter()
+            .map(|&b| {
+                let sym = gpt2_byte_to_char(b).to_string();
+                u32::try_from(tokens.iter().position(|t| t == &sym).expect("byte token"))
+                    .expect("id")
+            })
+            .collect();
+        for &byte_tok in &rocket_ids[..3] {
+            let step = streamer.push_token(byte_tok).expect("partial utf8 byte");
+            assert_eq!(step, DetokenizeStep::Hold);
+        }
+        let final_step = streamer.push_token(rocket_ids[3]).expect("complete emoji");
+        assert_eq!(final_step, DetokenizeStep::Emit("🚀".to_owned()));
+
+        let prompt_ids = tok
+            .tokenize_prompt(" hi", true, 64)
+            .expect("chat template prompt");
+        assert!(prompt_ids.contains(&2), "prompt should include <|eot_id|>");
+        assert!(prompt_ids.contains(&3) && prompt_ids.contains(&4));
+    }
+
+    #[test]
+    fn test_pretokenizer_family_splitting() {
+        assert_eq!(
+            PreTokenizerKind::from_gguf_pre(Some("llama-bpe")),
+            Some(PreTokenizerKind::Llama3)
+        );
+        assert_eq!(
+            PreTokenizerKind::from_gguf_pre(Some("qwen2")),
+            Some(PreTokenizerKind::Qwen2)
+        );
+        assert_eq!(
+            PreTokenizerKind::from_gguf_pre(Some("deepseek-coder")),
+            Some(PreTokenizerKind::DeepSeek)
+        );
+        assert_eq!(
+            PreTokenizerKind::from_gguf_pre(Some("tekken")),
+            Some(PreTokenizerKind::Tekken)
+        );
+        assert_eq!(
+            PreTokenizerKind::from_gguf_pre(Some("gpt2")),
+            Some(PreTokenizerKind::DefaultGpt2)
+        );
+
+        assert_eq!(
+            split_pretokens(PreTokenizerKind::Llama3, "2026 12345"),
+            vec!["202", "6", " ", "123", "45"]
+        );
+        assert_eq!(
+            split_pretokens(PreTokenizerKind::Qwen2, "2026"),
+            vec!["2", "0", "2", "6"]
+        );
+        assert_eq!(
+            split_pretokens(PreTokenizerKind::DefaultGpt2, "2026 don't DON'T"),
+            vec!["2026", " don", "'t", " DON", "'", "T"]
+        );
+        assert_eq!(
+            split_pretokens(PreTokenizerKind::Llama3, "don't I'LL"),
+            vec!["don", "'t", " I", "'LL"]
+        );
+        assert_eq!(
+            split_pretokens(PreTokenizerKind::Tekken, "fooBar 2026"),
+            vec!["foo", "Bar", " ", "2", "0", "2", "6"]
+        );
+
+        let code = "fn add(a: u32) {\n    a + 12345\n}\n";
+        let ds_chunks = split_pretokens(PreTokenizerKind::DeepSeek, code);
+        assert_eq!(ds_chunks.concat(), code);
+        assert!(ds_chunks.contains(&"\n"));
+        assert_eq!(
+            split_pretokens(PreTokenizerKind::Llama3, code).concat(),
+            code
+        );
+    }
+
+    #[test]
+    fn test_bpe_priority_tie_breaking_and_long_span() {
+        let rules = [("a", "b"), ("b", "a"), ("ab", "ab"), ("a", "a")];
+        let mut merge_ranks = HashMap::new();
+        for (rank, &(l, r)) in rules.iter().enumerate() {
+            merge_ranks.insert((l.to_owned(), r.to_owned()), rank);
+        }
+
+        for sample in ["abababa", "aaaaaaa", "baabaaab", "abaababa"] {
+            let expected = naive_bpe_reference(sample, &rules);
+            let actual = gpt2_bpe::bpe_merge_priority(sample, &merge_ranks);
+            assert_eq!(actual, expected, "mismatch for `{sample}`");
+        }
+
+        // 4 KiB continuous span compresses cleanly in O(k log k) time.
+        let span_4k = "ab".repeat(2048);
+        let merged = gpt2_bpe::bpe_merge_priority(&span_4k, &merge_ranks);
+        assert_eq!(merged.len(), 1024);
+        assert!(merged.iter().all(|tok| tok == "abab"));
+    }
+
+    #[test]
+    fn test_unigram_viterbi_scores_and_add_space_prefix() {
+        let mut tokens = vec![
+            "<unk>".to_owned(),
+            "<s>".to_owned(),
+            "</s>".to_owned(),
+            "\u{2581}helloworld".to_owned(),
+            "\u{2581}hello".to_owned(),
+            "world".to_owned(),
+        ];
+        let mut token_types = vec![2, 3, 3, 1, 1, 1];
+        let mut scores = vec![0.0_f32, 0.0, 0.0, -20.0, -1.0, -1.0];
+        for byte in 0_u8..=u8::MAX {
+            if byte == 0xF0 {
+                continue;
+            }
+            tokens.push(format!("<0x{byte:02X}>"));
+            token_types.push(6);
+            scores.push(-10.0);
+        }
+        let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let bytes = build_minimal_gguf_v3(&[
+            ("general.architecture", GgufValue::String("llama")),
+            ("tokenizer.ggml.model", GgufValue::String("llama")),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(token_refs)),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(token_types)),
+            ),
+            (
+                "tokenizer.ggml.scores",
+                GgufValue::Array(GgufArray::Float32(scores)),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                GgufValue::Array(GgufArray::String(Vec::new())),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(2)),
+        ]);
+        let gguf = GgufFile::parse(&bytes).expect("parse unigram llama gguf");
+        let tok = GgufTokenizer::from_gguf(&gguf).expect("load unigram tokenizer");
+        assert!(tok.add_space_prefix());
+
+        // Viterbi chooses `▁hello` (-1.0) + `world` (-1.0) over `▁helloworld` (-20.0).
+        let ids = tok.encode("helloworld").expect("viterbi split");
+        assert_eq!(ids, vec![1, 4, 5]);
+
+        // Uncovered 4-byte emoji missing `<0xF0>` must fail closed with CapabilityMismatch.
+        let err = tok
+            .encode("🚀")
+            .expect_err("missing <0xF0> must fail closed");
+        assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
+
+        // Verify explicit `add_space_prefix = false` and `gemma2` default `false`.
+        let mut no_prefix_kvs = vec![
+            ("general.architecture", GgufValue::String("gemma2")),
+            ("tokenizer.ggml.model", GgufValue::String("llama")),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(vec![
+                    "<pad>",
+                    "<bos>",
+                    "<eos>",
+                    "\u{2581}hi",
+                ])),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(vec![3, 3, 3, 1])),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+        ];
+        let gemma_bytes = build_minimal_gguf_v3(&no_prefix_kvs);
+        let gemma_tok =
+            GgufTokenizer::from_gguf(&GgufFile::parse(&gemma_bytes).expect("parse")).expect("load");
+        assert!(!gemma_tok.add_space_prefix());
+
+        no_prefix_kvs.push(("tokenizer.ggml.add_space_prefix", GgufValue::Bool(true)));
+        let override_bytes = build_minimal_gguf_v3(&no_prefix_kvs);
+        let override_tok =
+            GgufTokenizer::from_gguf(&GgufFile::parse(&override_bytes).expect("parse"))
+                .expect("load");
+        assert!(override_tok.add_space_prefix());
+    }
+
+    #[test]
+    fn test_eos_token_ids_array_and_family_eot_stops() {
+        let tokens = vec![
+            "<unk>",
+            "<s>",
+            "</s>",
+            "<|end|>",
+            "<end_of_turn>",
+            "<|eom_id|>",
+            "<｜end▁of▁sentence｜>",
+            "<|assistant|>",
+            "custom_stop",
+            "normal_word",
+        ];
+        // Make `<|assistant|>` Normal (1) first, verify NOT a stop token unless Control/UserDefined.
+        let normal_types = vec![2, 3, 3, 3, 3, 3, 3, 1, 1, 1];
+        let bytes_normal = build_minimal_gguf_v3(&[
+            ("general.architecture", GgufValue::String("llama")),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens.clone())),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(normal_types)),
+            ),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(2)),
+            (
+                "tokenizer.ggml.eos_token_ids",
+                GgufValue::Array(GgufArray::Uint32(vec![8, 2, 8])),
+            ),
+        ]);
+        let tok_normal = GgufTokenizer::from_gguf(&GgufFile::parse(&bytes_normal).expect("parse"))
+            .expect("load");
+        let stops = tok_normal.special_tokens();
+        for expected_stop in [2_u32, 3, 4, 5, 6, 8] {
+            assert!(stops.is_stop(expected_stop));
+            assert!(stops.is_stop_token(expected_stop));
+        }
+        assert!(
+            !stops.is_stop_token(7),
+            "Normal <|assistant|> must not stop"
+        );
+        assert!(!stops.is_stop_token(9));
+
+        // Sorted & deduplicated `stop_tokens`.
+        let mut sorted = stops.stop_tokens.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(stops.stop_tokens, sorted);
+
+        // When `<|assistant|>` is Control (3), it becomes a stop token; Int32 `eos_token_ids` works too.
+        let control_types = vec![2, 3, 3, 3, 3, 3, 3, 3, 1, 1];
+        let bytes_ctrl = build_minimal_gguf_v3(&[
+            ("general.architecture", GgufValue::String("llama")),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens)),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(control_types)),
+            ),
+            (
+                "tokenizer.ggml.eos_token_ids",
+                GgufValue::Array(GgufArray::Int32(vec![8])),
+            ),
+        ]);
+        let tok_ctrl =
+            GgufTokenizer::from_gguf(&GgufFile::parse(&bytes_ctrl).expect("parse")).expect("load");
+        assert!(tok_ctrl.special_tokens().is_stop_token(7));
+        assert!(tok_ctrl.special_tokens().is_stop_token(8));
+    }
+
+    #[test]
+    fn test_streaming_detokenizer_dummy_space_and_utf8_fffd() {
+        let tokens = vec![
+            "<unk>",
+            "<s>",
+            "</s>",
+            "\u{2581}hello",
+            "\u{2581}\u{2581}hello",
+            "\u{2581}world",
+            "<0xFF>",
+            "<0xF0>",
+            "<0x9F>",
+            "a",
+        ];
+        let types = vec![2, 3, 3, 1, 1, 1, 6, 6, 6, 1];
+        let bytes = build_minimal_gguf_v3(&[
+            ("general.architecture", GgufValue::String("llama")),
+            ("tokenizer.ggml.model", GgufValue::String("llama")),
+            ("tokenizer.ggml.add_space_prefix", GgufValue::Bool(true)),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens)),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(types)),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(2)),
+        ]);
+        let tok = GgufTokenizer::from_gguf(&GgufFile::parse(&bytes).expect("parse")).expect("load");
+
+        // Control `<bos>` keeps stream-start active; first `▁hello` strips one synthetic space.
+        let mut s1 = tok.streaming_detokenizer();
+        assert_eq!(s1.push_token(1).expect("bos"), DetokenizeStep::Hold);
+        assert_eq!(
+            s1.push_token(3).expect("hello"),
+            DetokenizeStep::Emit("hello".to_owned())
+        );
+        assert_eq!(
+            s1.push_token(5).expect("world"),
+            DetokenizeStep::Emit(" world".to_owned())
+        );
+        assert_eq!(s1.finish(), "");
+
+        // Double `▁▁hello` strips only one synthetic space, preserving intentional leading space.
+        let mut s2 = tok.streaming_detokenizer();
+        assert_eq!(
+            s2.push_token(4).expect("double space"),
+            DetokenizeStep::Emit(" hello".to_owned())
+        );
+
+        // Invalid UTF-8 byte + truncated multi-byte prefix emit U+FFFD cleanly without dropping text.
+        let mut s3 = tok.streaming_detokenizer();
+        assert_eq!(
+            s3.push_token(6).expect("0xFF"),
+            DetokenizeStep::Emit("\u{FFFD}".to_owned())
+        );
+        assert_eq!(
+            s3.push_token(9).expect("ascii a"),
+            DetokenizeStep::Emit("a".to_owned())
+        );
+        assert_eq!(s3.push_token(7).expect("0xF0"), DetokenizeStep::Hold);
+        assert_eq!(s3.push_token(8).expect("0x9F"), DetokenizeStep::Hold);
+        assert_eq!(s3.finish(), "\u{FFFD}");
     }
 }
