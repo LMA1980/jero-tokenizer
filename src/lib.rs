@@ -73,6 +73,77 @@ impl SpecialTokens {
     }
 }
 
+/// A single conversational turn passed to [`ChatTemplate::format_messages`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    /// Conversation role identifier (for example `"system"`, `"user"`, or `"assistant"`).
+    pub role: String,
+    /// Unformatted text content of the message.
+    pub content: String,
+}
+
+impl ChatMessage {
+    /// Creates a new chat message with an explicit role and content.
+    #[must_use]
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    /// Creates a `"system"` chat message.
+    #[must_use]
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::new("system", content)
+    }
+
+    /// Creates a `"user"` chat message.
+    #[must_use]
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new("user", content)
+    }
+
+    /// Creates an `"assistant"` chat message.
+    #[must_use]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new("assistant", content)
+    }
+}
+
+/// Detected chat template family derived from GGUF `tokenizer.chat_template`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplateKind {
+    /// No `tokenizer.chat_template` metadata present; pass text through unmodified.
+    Raw,
+    /// Literal recipe placeholder containing `{{prompt}}`.
+    PlaceholderPrompt,
+    /// Literal recipe placeholder containing `{{content}}`.
+    PlaceholderContent,
+    /// `FunctionGemma` tool-call template (`<start_function_call>`).
+    FunctionGemma,
+    /// Nexa Octopus template (`<nexa_`).
+    Octopus,
+    /// xLAM tool-call template (`<|tool_call|>`).
+    Xlam,
+    /// Phi-4 template (`<|im_start|>role<|im_sep|>content<|im_end|>`).
+    Phi4,
+    /// Phi-3 / Phi-3.5 template (`<|user|>\n...<|end|>\n<|assistant|>\n`).
+    Phi3,
+    /// DeepSeek-R1 template (`<｜User｜>...<｜Assistant｜><think>\n`).
+    DeepSeekR1,
+    /// Gemma-2 / Gemma-3 turn template (`<start_of_turn>`).
+    Gemma,
+    /// Llama-3 / Llama-3.2 / Llama-Guard-3 header template (`<|start_header_id|>`).
+    Llama3,
+    /// `ChatML` / Qwen2.5 template (`<|im_start|>role\n...<|im_end|>\n`).
+    ChatMl,
+    /// Mistral / Mixtral instruction template (`[INST] ... [/INST]`).
+    Mistral,
+    /// Non-empty GGUF `tokenizer.chat_template` matching no supported family.
+    Unsupported,
+}
+
 /// Architecture-aware chat template formatter (ADR-023, ADR-025).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatTemplate {
@@ -92,39 +163,160 @@ impl ChatTemplate {
         self.raw_template.as_deref()
     }
 
+    /// Classifies the configured `tokenizer.chat_template` string.
+    #[must_use]
+    pub fn kind(&self) -> ChatTemplateKind {
+        let Some(tmpl) = self.raw_template.as_deref() else {
+            return ChatTemplateKind::Raw;
+        };
+        if tmpl.trim().is_empty() {
+            return ChatTemplateKind::Raw;
+        }
+        // Preserve downstream explicit placeholder templates before token pattern checks.
+        if tmpl.contains("{{prompt}}") {
+            return ChatTemplateKind::PlaceholderPrompt;
+        }
+        if tmpl.contains("{{content}}") {
+            return ChatTemplateKind::PlaceholderContent;
+        }
+        if tmpl.contains("<start_function_call>") {
+            return ChatTemplateKind::FunctionGemma;
+        }
+        if tmpl.contains("<nexa_") {
+            return ChatTemplateKind::Octopus;
+        }
+        if tmpl.contains("<|tool_call|>") {
+            return ChatTemplateKind::Xlam;
+        }
+        // Check `<|im_sep|>` (Phi-4) before `<|im_start|>` (ChatML) since Phi-4 uses both.
+        if tmpl.contains("<|im_sep|>") {
+            return ChatTemplateKind::Phi4;
+        }
+        if (tmpl.contains("<|user|>") || tmpl.contains("<|assistant|>")) && tmpl.contains("<|end|>")
+        {
+            return ChatTemplateKind::Phi3;
+        }
+        if tmpl.contains("<\u{FF5C}User\u{FF5C}>") || tmpl.contains("<\u{FF5C}Assistant\u{FF5C}>") {
+            return ChatTemplateKind::DeepSeekR1;
+        }
+        if tmpl.contains("<start_of_turn>") {
+            return ChatTemplateKind::Gemma;
+        }
+        if tmpl.contains("<|start_header_id|>") {
+            return ChatTemplateKind::Llama3;
+        }
+        if tmpl.contains("<|im_start|>") {
+            return ChatTemplateKind::ChatMl;
+        }
+        if tmpl.contains("[INST]") {
+            return ChatTemplateKind::Mistral;
+        }
+        ChatTemplateKind::Unsupported
+    }
+
+    /// Returns `true` when the template is either absent or matches a supported format.
+    #[must_use]
+    pub fn is_supported(&self) -> bool {
+        self.kind() != ChatTemplateKind::Unsupported
+    }
+
+    /// Returns a diagnostic message if a GGUF `tokenizer.chat_template` is present but unsupported.
+    #[must_use]
+    pub fn unsupported_diagnostic(&self) -> Option<String> {
+        if self.kind() != ChatTemplateKind::Unsupported {
+            return None;
+        }
+        let preview = self.raw_template.as_deref().map_or("", |raw| {
+            let mut end = raw.len().min(120);
+            while !raw.is_char_boundary(end) {
+                end -= 1;
+            }
+            &raw[..end]
+        });
+        Some(format!(
+            "unsupported GGUF tokenizer.chat_template pattern: \"{preview}\""
+        ))
+    }
+
     /// Formats an operator user prompt according to the model's chat template rules.
     #[must_use]
     pub fn format_prompt(&self, user_prompt: &str) -> String {
-        let Some(tmpl) = self.raw_template.as_deref() else {
-            return user_prompt.to_owned();
-        };
+        match self.kind() {
+            ChatTemplateKind::Raw | ChatTemplateKind::Unsupported => user_prompt.to_owned(),
+            ChatTemplateKind::PlaceholderPrompt => self
+                .raw_template
+                .as_deref()
+                .unwrap_or("")
+                .replace("{{prompt}}", user_prompt),
+            ChatTemplateKind::PlaceholderContent => self
+                .raw_template
+                .as_deref()
+                .unwrap_or("")
+                .replace("{{content}}", user_prompt),
+            ChatTemplateKind::FunctionGemma => format_functiongemma_prompt(user_prompt),
+            ChatTemplateKind::Octopus => format_octopus_prompt(user_prompt),
+            ChatTemplateKind::Xlam => format_xlam_prompt(user_prompt),
+            ChatTemplateKind::Gemma => self.format_gemma_prompt(user_prompt),
+            ChatTemplateKind::Phi4
+            | ChatTemplateKind::Phi3
+            | ChatTemplateKind::DeepSeekR1
+            | ChatTemplateKind::Llama3
+            | ChatTemplateKind::ChatMl
+            | ChatTemplateKind::Mistral => self.format_messages(&[ChatMessage::user(user_prompt)]),
+        }
+    }
 
-        if tmpl.contains("{{prompt}}") {
-            return tmpl.replace("{{prompt}}", user_prompt);
+    /// Formats an operator user prompt, failing closed when an unrecognized GGUF template is set.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] when `tokenizer.chat_template` does not match any
+    /// supported template family.
+    pub fn try_format_prompt(&self, user_prompt: &str) -> Result<String, K3Error> {
+        if let Some(reason) = self.unsupported_diagnostic() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "tokenizer".to_owned(),
+                reason,
+            });
         }
-        if tmpl.contains("{{content}}") {
-            return tmpl.replace("{{content}}", user_prompt);
-        }
-        if tmpl.contains("<start_function_call>") {
-            return format_functiongemma_prompt(user_prompt);
-        }
-        if tmpl.contains("<nexa_") {
-            return format_octopus_prompt(user_prompt);
-        }
-        if tmpl.contains("<|tool_call|>") {
-            return format_xlam_prompt(user_prompt);
-        }
-        if tmpl.contains("<start_of_turn>") {
-            return self.format_gemma_prompt(user_prompt);
-        }
-        if tmpl.contains("<|im_start|>") {
-            return format!("<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n");
-        }
-        if tmpl.contains("[INST]") {
-            return format!("[INST] {user_prompt} [/INST]");
-        }
+        Ok(self.format_prompt(user_prompt))
+    }
 
-        user_prompt.to_owned()
+    /// Formats a sequence of chat messages according to the model's chat template rules.
+    #[must_use]
+    pub fn format_messages(&self, messages: &[ChatMessage]) -> String {
+        match self.kind() {
+            ChatTemplateKind::Raw | ChatTemplateKind::Unsupported => join_raw_messages(messages),
+            ChatTemplateKind::PlaceholderPrompt
+            | ChatTemplateKind::PlaceholderContent
+            | ChatTemplateKind::FunctionGemma
+            | ChatTemplateKind::Octopus
+            | ChatTemplateKind::Xlam => {
+                let prompt = combine_system_and_last_user(messages);
+                self.format_prompt(&prompt)
+            }
+            ChatTemplateKind::Phi4 => format_phi4_messages(messages),
+            ChatTemplateKind::Phi3 => format_phi3_messages(messages),
+            ChatTemplateKind::DeepSeekR1 => format_deepseek_r1_messages(messages),
+            ChatTemplateKind::Gemma => format_gemma_messages(messages),
+            ChatTemplateKind::Llama3 => format_llama3_messages(messages),
+            ChatTemplateKind::ChatMl => format_chatml_messages(messages),
+            ChatTemplateKind::Mistral => format_mistral_messages(messages),
+        }
+    }
+
+    /// Formats a sequence of chat messages, failing closed on unrecognized GGUF templates.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] when `tokenizer.chat_template` does not match any
+    /// supported template family.
+    pub fn try_format_messages(&self, messages: &[ChatMessage]) -> Result<String, K3Error> {
+        if let Some(reason) = self.unsupported_diagnostic() {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "tokenizer".to_owned(),
+                reason,
+            });
+        }
+        Ok(self.format_messages(messages))
     }
 
     /// Formats a prompt using the NVIDIA Nemotron-Labs Dory1.0 `ChatML` + `<think>` template:
@@ -279,6 +471,176 @@ pub fn format_dory_chatml_prompt(
             "{DORY_BOS_TOKEN}<|im_start|>user\n{user_turn}{DORY_EOS_TOKEN}\n<|im_start|>assistant\n<think></think>"
         )
     }
+}
+
+fn join_raw_messages(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .map(|msg| msg.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn combine_system_and_last_user(messages: &[ChatMessage]) -> String {
+    let system_parts: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == "system" && !m.content.is_empty())
+        .map(|m| m.content.as_str())
+        .collect();
+    let user_part = messages
+        .iter()
+        .rfind(|m| m.role == "user")
+        .or_else(|| messages.last())
+        .map_or("", |m| m.content.as_str());
+    if system_parts.is_empty() {
+        user_part.to_owned()
+    } else if user_part.is_empty() {
+        system_parts.join("\n\n")
+    } else {
+        format!("{}\n\n{user_part}", system_parts.join("\n\n"))
+    }
+}
+
+fn format_phi4_messages(messages: &[ChatMessage]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for msg in messages {
+        let _ = write!(
+            out,
+            "<|im_start|>{}<|im_sep|>{}<|im_end|>",
+            msg.role, msg.content
+        );
+    }
+    out.push_str("<|im_start|>assistant<|im_sep|>");
+    out
+}
+
+fn format_phi3_messages(messages: &[ChatMessage]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for msg in messages {
+        let _ = write!(out, "<|{}|>\n{}<|end|>\n", msg.role, msg.content);
+    }
+    out.push_str("<|assistant|>\n");
+    out
+}
+
+fn format_deepseek_r1_messages(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for msg in messages.iter().filter(|m| m.role == "system") {
+        out.push_str(&msg.content);
+    }
+    for msg in messages.iter().filter(|m| m.role != "system") {
+        if msg.role == "user" {
+            out.push_str("<\u{FF5C}User\u{FF5C}>");
+            out.push_str(&msg.content);
+        } else if msg.role == "assistant" {
+            out.push_str("<\u{FF5C}Assistant\u{FF5C}>");
+            out.push_str(&msg.content);
+            out.push_str("<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>");
+        } else {
+            out.push_str(&msg.content);
+        }
+    }
+    out.push_str("<\u{FF5C}Assistant\u{FF5C}><think>\n");
+    out
+}
+
+fn format_gemma_messages(messages: &[ChatMessage]) -> String {
+    use std::fmt::Write as _;
+    let system_prefix: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == "system" && !m.content.is_empty())
+        .map(|m| m.content.as_str())
+        .collect();
+    let system_joined = system_prefix.join("\n\n");
+    let mut system_consumed = system_joined.is_empty();
+
+    let mut out = String::new();
+    for msg in messages.iter().filter(|m| m.role != "system") {
+        let role = if msg.role == "assistant" {
+            "model"
+        } else {
+            msg.role.as_str()
+        };
+        if !system_consumed && role == "user" {
+            system_consumed = true;
+            let _ = write!(
+                out,
+                "<start_of_turn>user\n{system_joined}\n\n{}{GEMMA_EOT_TOKEN}\n",
+                msg.content
+            );
+        } else {
+            let _ = write!(
+                out,
+                "<start_of_turn>{role}\n{}{GEMMA_EOT_TOKEN}\n",
+                msg.content
+            );
+        }
+    }
+    if !system_consumed {
+        let _ = write!(
+            out,
+            "<start_of_turn>user\n{system_joined}{GEMMA_EOT_TOKEN}\n"
+        );
+    }
+    out.push_str("<start_of_turn>model\n");
+    out
+}
+
+fn format_llama3_messages(messages: &[ChatMessage]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for msg in messages {
+        let _ = write!(
+            out,
+            "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+            msg.role, msg.content
+        );
+    }
+    out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    out
+}
+
+fn format_chatml_messages(messages: &[ChatMessage]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for msg in messages {
+        let _ = write!(out, "<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content);
+    }
+    out.push_str("<|im_start|>assistant\n");
+    out
+}
+
+fn format_mistral_messages(messages: &[ChatMessage]) -> String {
+    use std::fmt::Write as _;
+    let system_prefix: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == "system" && !m.content.is_empty())
+        .map(|m| m.content.as_str())
+        .collect();
+    let system_joined = system_prefix.join("\n\n");
+    let mut system_consumed = system_joined.is_empty();
+
+    let mut out = String::new();
+    for msg in messages.iter().filter(|m| m.role != "system") {
+        if msg.role == "user" {
+            if system_consumed {
+                let _ = write!(out, "[INST] {} [/INST]", msg.content);
+            } else {
+                system_consumed = true;
+                let _ = write!(out, "[INST] {system_joined}\n\n{} [/INST]", msg.content);
+            }
+        } else if msg.role == "assistant" {
+            let _ = write!(out, "{}</s>", msg.content);
+        } else {
+            out.push_str(&msg.content);
+        }
+    }
+    if !system_consumed {
+        let _ = write!(out, "[INST] {system_joined} [/INST]");
+    }
+    out
 }
 
 fn is_smuggled_or_disallowed_guardrail_char(ch: char) -> bool {
@@ -741,7 +1103,9 @@ impl GgufTokenizer {
             }
 
             let ttype = token_types.get(idx).copied().unwrap_or(TokenType::Normal);
-            if (ttype == TokenType::Control || is_func) && !text.is_empty() {
+            if (matches!(ttype, TokenType::Control | TokenType::UserDefined) || is_func)
+                && !text.is_empty()
+            {
                 control_tokens.push((text.clone(), id));
             }
         }
@@ -775,7 +1139,7 @@ impl GgufTokenizer {
         let add_bos_token = gguf
             .metadata_value("tokenizer.ggml.add_bos_token")
             .and_then(GgufValue::as_bool)
-            .unwrap_or(false);
+            .unwrap_or_else(|| model_type == "llama");
 
         let mut stop_tokens = Vec::new();
         if let Some(eos) = eos_token_id {
@@ -900,7 +1264,8 @@ impl GgufTokenizer {
     /// # Errors
     ///
     /// - Returns [`K3Error::ContextLengthExceeded`] if `n_ctx == 0` or `tokens.len() >= n_ctx`.
-    /// - Returns [`K3Error::CapabilityMismatch`] if input text contains unencodable sequences.
+    /// - Returns [`K3Error::CapabilityMismatch`] if input text contains unencodable sequences or an
+    ///   unrecognized GGUF `tokenizer.chat_template`.
     pub fn tokenize_prompt(
         &self,
         prompt: &str,
@@ -908,7 +1273,7 @@ impl GgufTokenizer {
         n_ctx: usize,
     ) -> Result<Vec<u32>, K3Error> {
         let formatted = if apply_chat_template {
-            self.chat_template.format_prompt(prompt)
+            self.chat_template.try_format_prompt(prompt)?
         } else {
             prompt.to_owned()
         };
@@ -1001,8 +1366,6 @@ impl GgufTokenizer {
                 for &b in &remaining.as_bytes()[..char_len] {
                     if let Some(byte_id) = self.byte_tokens[usize::from(b)] {
                         out.push(byte_id);
-                    } else if let Some(pad_id) = self.special_tokens.padding_token_id {
-                        out.push(pad_id);
                     } else {
                         return Err(K3Error::CapabilityMismatch {
                             architecture: "tokenizer".to_owned(),
@@ -1099,12 +1462,7 @@ impl GgufTokenizer {
 
 impl Tokenizer for GgufTokenizer {
     fn encode(&self, text: &str) -> Result<Vec<u32>, K3Error> {
-        let mut tokens = Vec::new();
-        if self.special_tokens.add_bos_token {
-            if let Some(bos) = self.special_tokens.bos_token_id {
-                tokens.push(bos);
-            }
-        }
+        let mut body_tokens = Vec::new();
 
         let mut cursor = 0usize;
         while cursor < text.len() {
@@ -1116,7 +1474,7 @@ impl Tokenizer for GgufTokenizer {
                 .iter()
                 .find(|(ctrl, _)| remaining.starts_with(ctrl.as_str()))
             {
-                tokens.push(*ctrl_id);
+                body_tokens.push(*ctrl_id);
                 cursor += ctrl_str.len();
                 continue;
             }
@@ -1130,11 +1488,22 @@ impl Tokenizer for GgufTokenizer {
                 .unwrap_or(remaining.len());
 
             let span = &remaining[..next_ctrl_offset];
-            self.encode_segment(span, &mut tokens)?;
+            self.encode_segment(span, &mut body_tokens)?;
             cursor += next_ctrl_offset;
         }
 
-        Ok(tokens)
+        if self.special_tokens.add_bos_token {
+            if let Some(bos) = self.special_tokens.bos_token_id {
+                if body_tokens.first().copied() != Some(bos) {
+                    let mut tokens = Vec::with_capacity(body_tokens.len() + 1);
+                    tokens.push(bos);
+                    tokens.extend(body_tokens);
+                    return Ok(tokens);
+                }
+            }
+        }
+
+        Ok(body_tokens)
     }
 
     fn decode(&self, tokens: &[u32]) -> Result<String, K3Error> {
@@ -1672,18 +2041,19 @@ mod tests {
         roundtrip.push_str(&detok.finish());
         assert_eq!(roundtrip, prompt);
 
-        // 2. `padding_token_id` fallback vocabulary (no `<0xXX>` tokens, as in synthetic fixtures)
+        // 2. Unencodable bytes without `<0xXX>` fallback fail closed (never silently emit padding_token_id)
         let synthetic_bytes = create_synthetic_gguf_v3("synthetic", 32, &[]);
         let synthetic_gguf = GgufFile::parse(&synthetic_bytes).expect("parse synthetic gguf");
         let pad_tok =
             GgufTokenizer::from_gguf(&synthetic_gguf).expect("load synthetic pad tokenizer");
 
-        let pad_encoded = pad_tok
-            .encode("Janet’s — €100 🚀")
-            .expect("padding fallback across 3-byte and 4-byte scalars must not panic");
+        assert!(pad_tok.special_tokens().padding_token_id.is_some());
+        let pad_err = pad_tok.encode("Janet’s — €100 🚀").expect_err(
+            "missing byte-fallback tokens must fail closed instead of emitting padding",
+        );
         assert!(
-            !pad_encoded.is_empty(),
-            "encoded multi-byte prompt must produce non-empty token list"
+            matches!(pad_err, K3Error::CapabilityMismatch { .. }),
+            "expected CapabilityMismatch on unencodable multi-byte UTF-8, got {pad_err:?}"
         );
     }
 
@@ -1914,5 +2284,388 @@ mod tests {
             normalize_guardrail_input(precomposed)
         );
         assert_eq!(normalize_guardrail_input("cafe\u{0301}"), "caf\u{00E9}");
+    }
+
+    #[test]
+    fn test_chat_template_phi3_and_phi4_formatting() {
+        let phi3 = ChatTemplate::new(Some(
+            "{% for message in messages %}{% if message['role'] == 'user' %}{{'<|user|>\n' + message['content'] + '<|end|>\n'}}{% endif %}{% endfor %}<|assistant|>\n".to_owned(),
+        ));
+        assert_eq!(phi3.kind(), ChatTemplateKind::Phi3);
+        assert!(phi3.is_supported());
+        assert_eq!(
+            phi3.format_prompt("Explain RVV"),
+            "<|user|>\nExplain RVV<|end|>\n<|assistant|>\n"
+        );
+        assert_eq!(
+            phi3.try_format_messages(&[
+                ChatMessage::system("Be concise."),
+                ChatMessage::user("Explain RVV"),
+            ])
+            .expect("phi3 messages"),
+            "<|system|>\nBe concise.<|end|>\n<|user|>\nExplain RVV<|end|>\n<|assistant|>\n"
+        );
+
+        let phi4 = ChatTemplate::new(Some(
+            "{% for m in messages %}<|im_start|>{{ m['role'] }}<|im_sep|>{{ m['content'] }}<|im_end|>{% endfor %}<|im_start|>assistant<|im_sep|>".to_owned(),
+        ));
+        assert_eq!(phi4.kind(), ChatTemplateKind::Phi4);
+        assert_eq!(
+            phi4.format_prompt("Hello"),
+            "<|im_start|>user<|im_sep|>Hello<|im_end|><|im_start|>assistant<|im_sep|>"
+        );
+        assert_eq!(
+            phi4.format_messages(&[ChatMessage::system("Sys"), ChatMessage::user("Hello")]),
+            "<|im_start|>system<|im_sep|>Sys<|im_end|><|im_start|>user<|im_sep|>Hello<|im_end|><|im_start|>assistant<|im_sep|>"
+        );
+    }
+
+    #[test]
+    fn test_chat_template_deepseek_r1_formatting() {
+        let ds = ChatTemplate::new(Some(
+            "{% for message in messages %}<｜User｜>{{ message['content'] }}<｜Assistant｜><think>\n{% endfor %}".to_owned(),
+        ));
+        assert_eq!(ds.kind(), ChatTemplateKind::DeepSeekR1);
+        assert_eq!(
+            ds.format_prompt("Solve 2+2"),
+            "<\u{FF5C}User\u{FF5C}>Solve 2+2<\u{FF5C}Assistant\u{FF5C}><think>\n"
+        );
+        assert_eq!(
+            ds.format_messages(&[
+                ChatMessage::system("Math helper. "),
+                ChatMessage::user("Solve 2+2"),
+            ]),
+            "Math helper. <\u{FF5C}User\u{FF5C}>Solve 2+2<\u{FF5C}Assistant\u{FF5C}><think>\n"
+        );
+        assert_eq!(
+            ds.format_messages(&[
+                ChatMessage::user("Hi"),
+                ChatMessage::assistant("Hello!"),
+                ChatMessage::user("Next?"),
+            ]),
+            "<\u{FF5C}User\u{FF5C}>Hi<\u{FF5C}Assistant\u{FF5C}>Hello!<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}User\u{FF5C}>Next?<\u{FF5C}Assistant\u{FF5C}><think>\n"
+        );
+    }
+
+    #[test]
+    fn test_chat_template_chatml_gemma_mistral_llama3_and_placeholders() {
+        let chatml = ChatTemplate::new(Some(
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n".to_owned(),
+        ));
+        assert_eq!(chatml.kind(), ChatTemplateKind::ChatMl);
+        assert_eq!(
+            chatml.format_messages(&[ChatMessage::system("Sys"), ChatMessage::user("Hi")]),
+            "<|im_start|>system\nSys<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
+
+        let gemma = ChatTemplate::new(Some("<start_of_turn>user".to_owned()));
+        assert_eq!(gemma.kind(), ChatTemplateKind::Gemma);
+        assert_eq!(
+            gemma.format_messages(&[
+                ChatMessage::system("Follow rules."),
+                ChatMessage::user("Hi"),
+                ChatMessage::assistant("Hey"),
+                ChatMessage::user("Why?"),
+            ]),
+            "<start_of_turn>user\nFollow rules.\n\nHi<end_of_turn>\n<start_of_turn>model\nHey<end_of_turn>\n<start_of_turn>user\nWhy?<end_of_turn>\n<start_of_turn>model\n"
+        );
+
+        let mistral = ChatTemplate::new(Some(
+            "{{ bos_token }}[INST] {{ user_message }} [/INST]".to_owned(),
+        ));
+        assert_eq!(mistral.kind(), ChatTemplateKind::Mistral);
+        assert_eq!(mistral.format_prompt("Hi"), "[INST] Hi [/INST]");
+        assert_eq!(
+            mistral.format_messages(&[
+                ChatMessage::system("Be brief."),
+                ChatMessage::user("U1"),
+                ChatMessage::assistant("A1"),
+                ChatMessage::user("U2"),
+            ]),
+            "[INST] Be brief.\n\nU1 [/INST]A1</s>[INST] U2 [/INST]"
+        );
+
+        let llama3 = ChatTemplate::new(Some(
+            "{% for m in messages %}<|start_header_id|>{{ m['role'] }}<|end_header_id|>\n\n{{ m['content'] }}<|eot_id|>{% endfor %}".to_owned(),
+        ));
+        assert_eq!(llama3.kind(), ChatTemplateKind::Llama3);
+        assert_eq!(
+            llama3.format_messages(&[ChatMessage::system("Sys"), ChatMessage::user("Hi")]),
+            "<|start_header_id|>system<|end_header_id|>\n\nSys<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+
+        // Literal `{{prompt}}` placeholder remains highest priority for recipe overrides.
+        let placeholder = ChatTemplate::new(Some(
+            "<|im_start|>user<|im_sep|>{{prompt}}<|im_end|>".to_owned(),
+        ));
+        assert_eq!(placeholder.kind(), ChatTemplateKind::PlaceholderPrompt);
+        assert_eq!(
+            placeholder.format_prompt("Hi"),
+            "<|im_start|>user<|im_sep|>Hi<|im_end|>"
+        );
+    }
+
+    #[test]
+    fn test_chat_template_unsupported_fail_closed_diagnostic() {
+        let bogus_template = ChatTemplate::new(Some(
+            "{% for msg in msgs %}{{ msg.sender }} => {{ msg.body }}{% endfor %}".to_owned(),
+        ));
+        assert_eq!(bogus_template.kind(), ChatTemplateKind::Unsupported);
+        assert!(!bogus_template.is_supported());
+        assert!(bogus_template.unsupported_diagnostic().is_some());
+        assert!(matches!(
+            bogus_template.try_format_prompt("hello"),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+        assert!(matches!(
+            bogus_template.try_format_messages(&[ChatMessage::user("hello")]),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        let extra_kvs = [(
+            "tokenizer.chat_template",
+            GgufValue::String("{% unknown template syntax %}"),
+        )];
+        let bytes = create_synthetic_gguf_v3_with_kvs("llama", 32, &extra_kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse gguf");
+        let tok = GgufTokenizer::from_gguf(&gguf).expect("load tokenizer");
+        assert!(matches!(
+            tok.tokenize_prompt("hello", true, 64),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+        assert!(tok.tokenize_prompt("hello", false, 64).is_ok());
+    }
+
+    fn build_minimal_gguf_v3(kvs: &[(&str, GgufValue<'_>)]) -> Vec<u8> {
+        fn write_str(buf: &mut Vec<u8>, s: &str) {
+            let len = u64::try_from(s.len()).expect("string len fits u64");
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3_u32.to_le_bytes());
+        buf.extend_from_slice(&0_u64.to_le_bytes());
+        let kv_len = u64::try_from(kvs.len()).expect("kv count fits u64");
+        buf.extend_from_slice(&kv_len.to_le_bytes());
+        for (key, val) in kvs {
+            write_str(&mut buf, key);
+            match val {
+                GgufValue::Uint32(v) => {
+                    buf.extend_from_slice(&4_u32.to_le_bytes());
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+                GgufValue::String(s) => {
+                    buf.extend_from_slice(&8_u32.to_le_bytes());
+                    write_str(&mut buf, s);
+                }
+                GgufValue::Array(GgufArray::String(items)) => {
+                    buf.extend_from_slice(&9_u32.to_le_bytes());
+                    buf.extend_from_slice(&8_u32.to_le_bytes());
+                    let count = u64::try_from(items.len()).expect("array len fits u64");
+                    buf.extend_from_slice(&count.to_le_bytes());
+                    for item in items {
+                        write_str(&mut buf, item);
+                    }
+                }
+                GgufValue::Array(GgufArray::Int32(items)) => {
+                    buf.extend_from_slice(&9_u32.to_le_bytes());
+                    buf.extend_from_slice(&5_u32.to_le_bytes());
+                    let count = u64::try_from(items.len()).expect("array len fits u64");
+                    buf.extend_from_slice(&count.to_le_bytes());
+                    for item in items {
+                        buf.extend_from_slice(&item.to_le_bytes());
+                    }
+                }
+                _ => panic!("unsupported GgufValue in minimal test builder"),
+            }
+        }
+        let rem = buf.len() % 32;
+        if rem != 0 {
+            buf.resize(buf.len() + (32 - rem), 0);
+        }
+        buf
+    }
+
+    #[test]
+    fn test_gguf_omitted_add_bos_token_defaults() {
+        // 1. Omitted `add_bos_token` defaults to true only when `tokenizer.ggml.model == "llama"`.
+        let tokens = vec!["<unk>", "<s>", "</s>", "hello", "<|begin_of_text|>"];
+        let token_types = vec![2, 3, 3, 1, 3];
+        let llama_kvs = [
+            ("general.architecture", GgufValue::String("llama")),
+            ("tokenizer.ggml.model", GgufValue::String("llama")),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens.clone())),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(token_types.clone())),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                GgufValue::Array(GgufArray::String(Vec::new())),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(2)),
+        ];
+
+        let llama_bytes = build_minimal_gguf_v3(&llama_kvs);
+        let llama_gguf = GgufFile::parse(&llama_bytes).expect("parse llama gguf");
+        let llama_tok = GgufTokenizer::from_gguf(&llama_gguf).expect("load llama tokenizer");
+        assert!(llama_tok.special_tokens().add_bos_token);
+        assert_eq!(llama_tok.encode("hello").expect("llama encode"), vec![1, 3]);
+        // Template emitting literal `<s>` must NOT double-prepend BOS id 1.
+        assert_eq!(
+            llama_tok.encode("<s>hello").expect("llama dedup bos"),
+            vec![1, 3]
+        );
+
+        let gpt2_kvs = [
+            ("general.architecture", GgufValue::String("qwen2")),
+            ("tokenizer.ggml.model", GgufValue::String("gpt2")),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens)),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(token_types)),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                GgufValue::Array(GgufArray::String(Vec::new())),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(2)),
+        ];
+        let qwen_bytes = build_minimal_gguf_v3(&gpt2_kvs);
+        let qwen_gguf = GgufFile::parse(&qwen_bytes).expect("parse qwen2 gguf");
+        let qwen_tok = GgufTokenizer::from_gguf(&qwen_gguf).expect("load qwen2 tokenizer");
+        assert!(!qwen_tok.special_tokens().add_bos_token);
+        assert_eq!(qwen_tok.encode("hello").expect("qwen2 encode"), vec![3]);
+    }
+
+    #[test]
+    fn test_gguf_bos_token_deduplication() {
+        // Llama-3 `<|begin_of_text|>` and Gemma `<bos>` deduplication when `add_bos_token = true`.
+        let header_bos_kvs = [
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(vec![
+                    "<unk>",
+                    "<|begin_of_text|>",
+                    "<|end_of_text|>",
+                    "hello",
+                    "<bos>",
+                ])),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(vec![2, 3, 4, 1, 3])),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                GgufValue::Array(GgufArray::String(Vec::new())),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.add_bos_token", GgufValue::Bool(true)),
+        ];
+        let header_bos_bytes = create_synthetic_gguf_v3_with_kvs("llama", 32, &header_bos_kvs, &[]);
+        let header_bos_gguf = GgufFile::parse(&header_bos_bytes).expect("parse llama3 gguf");
+        let header_bos_tok =
+            GgufTokenizer::from_gguf(&header_bos_gguf).expect("load llama3 tokenizer");
+        assert_eq!(
+            header_bos_tok
+                .encode("<|begin_of_text|>hello")
+                .expect("dedup <|begin_of_text|>"),
+            vec![1, 3]
+        );
+
+        let gemma_bos_kvs = [
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(vec!["<pad>", "<bos>", "<eos>", "hello"])),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(vec![3, 3, 3, 1])),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                GgufValue::Array(GgufArray::String(Vec::new())),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.add_bos_token", GgufValue::Bool(true)),
+        ];
+        let gemma_bos_bytes = create_synthetic_gguf_v3_with_kvs("gemma2", 32, &gemma_bos_kvs, &[]);
+        let gemma_bos_gguf = GgufFile::parse(&gemma_bos_bytes).expect("parse gemma2 gguf");
+        let gemma_bos_tok =
+            GgufTokenizer::from_gguf(&gemma_bos_gguf).expect("load gemma2 tokenizer");
+        assert_eq!(
+            gemma_bos_tok.encode("<bos>hello").expect("dedup <bos>"),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn test_gguf_user_defined_control_tokens_and_fail_closed_missing_bytes() {
+        // TokenType::UserDefined (4) markers must match atomically before subword encoding.
+        let tokens = vec![
+            "<pad>",
+            "<bos>",
+            "<eos>",
+            "<|user|>",
+            "<|end|>",
+            "<start_of_turn>",
+            "<|im_sep|>",
+            "\n",
+            "hi",
+            "<",
+            "|",
+            "user",
+            ">",
+        ];
+        // Notice IDs 3..=6 are TokenType::UserDefined (4), NOT Control (3).
+        let token_types = vec![3, 3, 3, 4, 4, 4, 4, 1, 1, 1, 1, 1, 1];
+        let extra_kvs = [
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(tokens)),
+            ),
+            (
+                "tokenizer.ggml.token_type",
+                GgufValue::Array(GgufArray::Int32(token_types)),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                GgufValue::Array(GgufArray::String(Vec::new())),
+            ),
+            ("tokenizer.ggml.bos_token_id", GgufValue::Uint32(1)),
+            ("tokenizer.ggml.eos_token_id", GgufValue::Uint32(2)),
+            ("tokenizer.ggml.padding_token_id", GgufValue::Uint32(0)),
+            ("tokenizer.ggml.add_bos_token", GgufValue::Bool(false)),
+        ];
+        let bytes = create_synthetic_gguf_v3_with_kvs("phi3", 32, &extra_kvs, &[]);
+        let gguf = GgufFile::parse(&bytes).expect("parse phi3 user_defined gguf");
+        let tok = GgufTokenizer::from_gguf(&gguf).expect("load phi3 tokenizer");
+
+        assert_eq!(
+            tok.encode("<|user|>\nhi<|end|>")
+                .expect("encode UserDefined phi3 markers atomically"),
+            vec![3, 7, 8, 4]
+        );
+        assert_eq!(
+            tok.encode("<start_of_turn><|im_sep|>")
+                .expect("encode UserDefined gemma/phi4 markers atomically"),
+            vec![5, 6]
+        );
+        // Unencodable multi-byte character without `<0xXX>` byte tokens must fail closed
+        // even when `padding_token_id` is configured.
+        let err = tok
+            .encode("hi 🚀")
+            .expect_err("missing byte token must return CapabilityMismatch");
+        assert!(matches!(err, K3Error::CapabilityMismatch { .. }));
     }
 }
